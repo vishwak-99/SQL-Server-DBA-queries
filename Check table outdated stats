@@ -1,0 +1,26 @@
+use LARGEPRDATR
+go
+
+select top 5 t.name as [Table Names],
+sum (p.rows) as [Total Rows]
+from sys.tables t
+ join sys.partitions p
+on t.object_id = p.object_id 
+and p.index_id in (0,1)
+where t.name like '%rec%'
+group by t.name
+order by [Total Rows] desc;
+SELECT distinct 
+sp.stats_id, 
+       name, 
+       filter_definition, 
+       last_updated, 
+       rows, 
+       rows_sampled, 
+       steps, 
+       unfiltered_rows, 
+       modification_counter
+FROM sys.stats AS stat
+     CROSS APPLY sys.dm_db_stats_properties(stat.object_id, stat.stats_id) AS sp
+WHERE stat.object_id = OBJECT_ID('dbo.ATRSEAGGREGATIONMATRIX')
+order by last_updated desc;
