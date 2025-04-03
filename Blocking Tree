@@ -1,0 +1,129 @@
+EXEC sp_WhoIsActive
+    --@get_locks = 0,
+	--@get_transaction_info  = 0,
+	@show_sleeping_spids = 0,
+	@get_plans = 1,
+    @find_block_leaders = 0,
+    @sort_order = '[blocked_session_count] desc'
+Or
+
+EXEC sp_WhoIsActive 
+    @output_column_list = '[dd hh:mm:ss.mss], 
+    [session_id],
+    [blocking_session_id], 
+    [database_name], 
+    [sql_text], 
+    [wait_info],
+    [status],
+    [login_name], 
+    [CPU], 
+    [percent_complete], 
+    [host_name], 
+    [start_time], 
+    [query_plan],
+    [program_name]',
+    @show_sleeping_spids = 0,
+    @get_plans = 1
+SET NOCOUNT ON;
+GO
+
+-- Temporary table to capture process and query details, including SPIDs, complete query text, and additional columns
+SELECT 
+    SPID,
+    BLOCKED,
+    R.status AS QueryStatus,  -- Add the query status
+    REPLACE(REPLACE(T.TEXT, CHAR(10), ' '), CHAR(13), ' ') AS QueryText,
+    R.loginame AS LoginName,
+    R.cpu AS CPUTime,
+    R.physical_io AS PhysicalIO,
+    R.waittime AS WaitTimeInMilliSeconds,
+    R.waittime / 1000.0 AS WaitTimeInSeconds,
+    R.waittype AS WaitType,  -- Add the wait type column
+    R.login_time AS StartTime,  -- Corrected calculation for query start time
+    -- Format the duration as DD HH:MM:SS
+    RIGHT('0' + CAST(DATEDIFF(SECOND, R.login_time, GETDATE()) / 86400 AS VARCHAR), 2) + ' ' +  
+    RIGHT('0' + CAST((DATEDIFF(SECOND, R.login_time, GETDATE()) % 86400) / 3600 AS VARCHAR), 2) + ':' +
+    RIGHT('0' + CAST((DATEDIFF(SECOND, R.login_time, GETDATE()) % 3600) / 60 AS VARCHAR), 2) + ':' +
+    RIGHT('0' + CAST(DATEDIFF(SECOND, R.login_time, GETDATE()) % 60 AS VARCHAR), 2) AS Duration_DD_HH_MM_SS,
+    COALESCE(OBJECT_NAME(T.OBJECTID, R.dbid), 'No SP Name') AS SPName -- Combined SP Name for both Blocker and Victim
+INTO #T
+FROM sys.sysprocesses R 
+CROSS APPLY sys.dm_exec_sql_text(R.SQL_HANDLE) T;
+GO
+
+-- Recursive CTE to build blocking tree
+WITH BLOCKERS (SPID, BLOCKED, LEVEL, QueryStatus, QueryText, LoginName, CPUTime, PhysicalIO, WaitTimeInMilliSeconds, WaitTimeInSeconds, WaitType, StartTime, Duration_DD_HH_MM_SS, SPName)
+AS
+(
+    SELECT 
+        SPID,
+        BLOCKED,
+        CAST(REPLICATE('0', 4-LEN(CAST(SPID AS VARCHAR))) + CAST(SPID AS VARCHAR) AS VARCHAR(1000)) AS LEVEL,
+        QueryStatus,
+        QueryText,
+        LoginName,
+        CPUTime,
+        PhysicalIO,
+        WaitTimeInMilliSeconds,
+        WaitTimeInSeconds,
+        WaitType,
+        StartTime,
+        Duration_DD_HH_MM_SS,
+        SPName
+    FROM #T R
+    WHERE (BLOCKED = 0 OR BLOCKED = SPID)
+        AND EXISTS (SELECT * FROM #T R2 WHERE R2.BLOCKED = R.SPID AND R2.BLOCKED <> R2.SPID)
+
+    UNION ALL
+
+    SELECT 
+        R.SPID,
+        R.BLOCKED,
+        CAST(BLOCKERS.LEVEL + RIGHT(CAST((1000 + R.SPID) AS VARCHAR), 4) AS VARCHAR(1000)) AS LEVEL,
+        R.QueryStatus,
+        R.QueryText,
+        R.LoginName,
+        R.CPUTime,
+        R.PhysicalIO,
+        R.WaitTimeInMilliSeconds,
+        R.WaitTimeInSeconds,
+        R.WaitType,
+        R.StartTime,
+        R.Duration_DD_HH_MM_SS,
+        R.SPName
+    FROM #T AS R
+    INNER JOIN BLOCKERS ON R.BLOCKED = BLOCKERS.SPID
+    WHERE R.BLOCKED > 0 AND R.BLOCKED <> R.SPID
+)
+
+-- Final select for blocking details with hierarchical representation and new columns
+SELECT  
+    StartTime,  -- New column for Start Time
+    Duration_DD_HH_MM_SS,
+    CASE 
+        WHEN BLOCKED = 0 THEN N'HEAD - ' + CAST(SPID AS NVARCHAR(10)) -- Format for Head Blocker
+        ELSE N'|---- ' + CAST(SPID AS NVARCHAR(10))  -- Format for Victim Session IDs
+    END AS BlockerSPID,  -- BlockerSPID now shows visual hierarchy
+    SPName AS SPName,  -- Combined SP Name for both Blocker and Victim
+    QueryStatus,  -- Add the status of the query (e.g., Running, Suspended, Sleeping)
+    QueryText,
+    LoginName,
+    CPUTime,
+    PhysicalIO,
+    WaitTimeInMilliSeconds,
+    WaitTimeInSeconds,
+    -- WaitType,  -- Include the wait type in the final select
+    -- New column with the updated name and format
+    N'    ' + REPLICATE(N'|         ', LEN(LEVEL)/4 - 1) +
+        CASE WHEN (LEN(LEVEL)/4 - 1) = 0
+             THEN 'HEAD -  '
+             ELSE '|------  ' 
+        END + CAST(SPID AS NVARCHAR(10)) + N' ' + QueryText AS BlockingTree
+FROM BLOCKERS
+ORDER BY LEVEL ASC;
+GO
+
+-- Drop temporary table
+DROP TABLE #T;
+GO
+
