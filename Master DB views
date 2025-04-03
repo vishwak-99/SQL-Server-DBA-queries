@@ -1,0 +1,125 @@
+/*
+select SCHEMA_NAME(schema_id()) as SchemaName, name
+from sys.all_objects
+where type = 'v' and name like '%exec%'
+
+*/
+
+WITH DMVData AS (
+    SELECT 
+        so.object_id,
+so.name AS [ObjectName],
+        sc.column_id AS [ColumnOrdinal],
+sc.name AS [Column],
+t.name AS [DataType],
+        sc.max_length,
+        sc.precision,
+        sc.scale,
+        ao.type_desc AS [ObjectType],  
+        sc.is_nullable,
+        sc.is_computed,
+        sc.is_identity,
+        sc.collation_name,
+        so.create_date,  
+        so.modify_date,  
+        COUNT(*) OVER(PARTITION BY so.object_id) AS [ColumnCount],
+        CASE 
+            -- Dynamic Management Views
+WHEN so.name LIKE 'dm_exec_%' THEN 'Query Execution DMV'
+WHEN so.name LIKE 'dm_os_%' THEN 'Operating System DMV'
+WHEN so.name LIKE 'dm_db_%' THEN 'Database DMV'
+WHEN so.name LIKE 'dm_io_%' THEN 'I/O DMV'
+WHEN so.name LIKE 'dm_tran_%' THEN 'Transaction DMV'
+WHEN so.name LIKE 'dm_index_%' THEN 'Index DMV'
+WHEN so.name LIKE 'dm_fts_%' THEN 'Full-Text Search DMV'
+            
+            -- System Metadata Tables & Views
+WHEN so.name IN ('sys.objects', 'sys.tables', 'sys.columns') THEN 'Schema & Metadata'
+WHEN so.name IN ('sys.indexes', 'sys.partitions', 'sys.allocation_units') THEN 'Index & Storage'
+WHEN so.name IN ('sys.foreign_keys', 'sys.check_constraints') THEN 'Constraints & Keys'
+WHEN so.name IN ('sys.views', 'sys.procedures', 'sys.triggers') THEN 'Programmability'
+            
+            -- Other SQL Server System Objects
+WHEN so.name LIKE 'sp_%' THEN 'System Stored Procedure'
+WHEN so.name LIKE 'xp_%' THEN 'Extended Stored Procedure'
+WHEN so.name LIKE 'fn_%' THEN 'System Function'
+ 
+            -- Default category
+            ELSE 'Other System Object'
+        END AS [ObjectCategory]
+    FROM sys.system_objects so
+    INNER JOIN sys.all_objects ao ON so.object_id = ao.object_id
+    INNER JOIN sys.system_columns sc ON so.object_id = sc.object_id
+    INNER JOIN sys.types t ON sc.user_type_id = t.user_type_id
+)
+SELECT
+    [ObjectName],
+    [Column],
+    [DataType],
+    [ColumnOrdinal],
+    [ColumnCount],
+    [ObjectCategory],
+    [ObjectType],  
+    CASE 
+        WHEN [DataType] IN ('nvarchar', 'nchar') THEN 
+            CASE WHEN max_length = -1 THEN 'max' 
+                 ELSE CAST(max_length / 2 AS varchar) + ' chars' END
+        WHEN [DataType] IN ('varchar', 'char', 'binary', 'varbinary') THEN 
+            CASE WHEN max_length = -1 THEN 'max' 
+                 ELSE CAST(max_length AS varchar) + 
+                      CASE WHEN [DataType] IN ('binary', 'varbinary') 
+                           THEN ' bytes' ELSE ' chars' END END
+        WHEN [DataType] IN ('datetime2', 'datetimeoffset', 'time') THEN 
+            CAST(scale AS varchar) + ' precision'
+        ELSE CAST(max_length AS varchar)
+    END AS [LengthInfo],
+    CASE 
+        WHEN [DataType] IN ('decimal', 'numeric') 
+        THEN '(' + CAST(precision AS varchar) + ', ' + CAST(scale AS varchar) + ')'
+        ELSE NULL
+    END AS [PrecisionScale],
+    CASE 
+        WHEN is_nullable = 1 THEN 'Yes'
+        ELSE 'No'
+    END AS [Nullable],
+    CASE 
+        WHEN is_computed = 1 THEN 'Yes'
+        ELSE 'No'
+    END AS [Computed],
+    CASE 
+        WHEN is_identity = 1 THEN 'Yes'
+        ELSE 'No'
+    END AS [Identity],
+    
+    CASE 
+        WHEN [DataType] = 'datetime' THEN 'Stores date and time values. Example: 2025-03-06 11:24:07'
+        WHEN [DataType] = 'date' THEN 'Stores date values only. Example: 2025-03-06'
+        WHEN [DataType] = 'time' THEN 'Stores time values only. Example: 11:24:07'
+        WHEN [DataType] = 'datetime2' THEN 'Stores date and time values with high precision. Example: 2025-03-06 11:24:07.1234567'
+        WHEN [DataType] = 'int' THEN 'Stores integer values.'
+        WHEN [DataType] = 'decimal' THEN 'Stores fixed precision and scale numbers. Example: 12345.67'
+        WHEN [DataType] = 'float' THEN 'Stores floating-point numbers. Example: 12345.67'
+        WHEN [DataType] = 'varchar' THEN 'Stores variable-length non-Unicode characters. Example: "Hello, World!"'
+        WHEN [DataType] = 'nvarchar' THEN 'Stores variable-length Unicode character data. Example: "你好, 世界!"'
+        WHEN [DataType] = 'varbinary' THEN 'Stores variable-length binary data. Example: 0x4D79537472696E67'
+        WHEN [DataType] = 'money' THEN 'Stores currency values. Example: 12345.67'
+        WHEN [DataType] = 'bit' THEN 'Stores Boolean values. Example: 1 (true) or 0 (false)'
+        WHEN [DataType] = 'uniqueidentifier' THEN 'Stores GUIDs. Example: "6F9619FF-8B86-D011-B42D-00C04FC964FE"'
+        ELSE 'No description available'
+    END AS [Description],
+    CASE 
+        WHEN [DataType] = 'date' THEN 'days'
+        WHEN [DataType] = 'time' THEN 'nanoseconds'
+        WHEN [DataType] = 'datetimeoffset' THEN 'nanoseconds'
+        WHEN [DataType] IN ('int', 'bigint', 'smallint', 'tinyint', 'decimal', 'numeric', 'float') THEN 'none'
+        WHEN [DataType] IN ('char', 'varchar', 'nchar', 'nvarchar') THEN 'characters'
+        WHEN [DataType] IN ('binary', 'varbinary') THEN 'bytes'
+        WHEN [DataType] IN ('money', 'smallmoney') THEN 'currency'
+        WHEN [DataType] = 'bit' THEN 'none'
+        WHEN [DataType] = 'uniqueidentifier' THEN 'none'
+        ELSE 'unknown'
+    END AS [Unit]
+FROM DMVData
+WHERE [ObjectCategory] LIKE '%Operating System DMV%' 
+ORDER BY [ObjectCategory], [ObjectName], [ColumnOrdinal];
+  
