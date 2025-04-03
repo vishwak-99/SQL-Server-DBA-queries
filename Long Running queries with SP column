@@ -1,0 +1,63 @@
+USE master;
+GO
+
+-- Query to find long running requests with percentage complete and formatted elapsed time
+SELECT
+    RIGHT('0' + CAST((r.total_elapsed_time / 86400000) AS VARCHAR), 2) + ' ' + -- Days
+    RIGHT('0' + CAST((r.total_elapsed_time % 86400000 / 3600000) AS VARCHAR), 2) + ':' + -- Hours
+    RIGHT('0' + CAST((r.total_elapsed_time % 3600000 / 60000) AS VARCHAR), 2) + ':' + -- Minutes
+    RIGHT('0' + CAST((r.total_elapsed_time % 60000 / 1000) AS VARCHAR), 2) + '.' + -- Seconds
+    RIGHT('000' + CAST((r.total_elapsed_time % 1000) AS VARCHAR), 3) AS [Elapsed Time (dd hh:mm:ss.mss)],
+    r.session_id AS [Session ID],
+    r.blocking_session_id AS [Blocked By],
+    COALESCE(OBJECT_NAME(st.objectid, st.dbid), '') AS [Procedure Name],
+    r.command AS [Command],
+    SUBSTRING(st.text, (r.statement_start_offset / 2) + 1,
+        (CASE
+            WHEN r.statement_end_offset = -1 THEN DATALENGTH(st.text)
+            ELSE r.statement_end_offset - r.statement_start_offset
+        END) / 2 + 1) AS [Statement Text],
+		
+    DB_NAME(r.database_id) AS [Database Name],
+	r.wait_type + ' (' + 
+        CASE 
+            WHEN r.wait_time >= 60000 THEN CAST(r.wait_time / 60000 AS VARCHAR) + ' min'
+            WHEN r.wait_time >= 1000 THEN CAST(r.wait_time / 1000 AS VARCHAR) + ' sec'
+            ELSE CAST(r.wait_time AS VARCHAR) + ' ms'
+        END + ')' AS [Wait Type],
+	 CASE 
+        WHEN r.cpu_time > 60000 THEN CAST(r.cpu_time / 60000 AS VARCHAR) + ' min'
+        WHEN r.cpu_time > 1000 THEN CAST(r.cpu_time / 1000 AS VARCHAR) + ' sec'
+        ELSE CAST(r.cpu_time AS VARCHAR) + ' ms'
+    END AS [CPU Time],
+
+    r.total_elapsed_time AS [Total Elapsed Time (ms)],
+    NULLIF(r.percent_complete, 0) AS [Percent Complete],
+	CASE 
+        WHEN r.wait_time > 60000 THEN CAST(r.wait_time / 60000 AS VARCHAR) + ' min'
+        WHEN r.wait_time > 1000 THEN CAST(r.wait_time / 1000 AS VARCHAR) + ' sec'
+        ELSE CAST(r.wait_time AS VARCHAR) + ' ms'
+    END AS [Wait Time],
+    r.start_time AS [Start Time],
+    
+	se.login_time AS [Login Time],
+	se.login_name AS [Login Name],
+    se.host_name AS [Host Name],
+    r.status AS [Status],
+    p.query_plan AS [Query Plan],
+    r.last_wait_type AS [Last Wait Type],
+    r.logical_reads AS [Logical Reads],
+    r.wait_resource AS [Wait Resource],
+    r.reads AS [Reads],
+    r.writes AS [Writes]
+FROM sys.dm_exec_requests r
+JOIN sys.dm_exec_sessions se ON r.session_id = se.session_id
+OUTER APPLY sys.dm_exec_sql_text(r.sql_handle) st
+OUTER APPLY sys.dm_exec_query_plan(r.plan_handle) p
+WHERE se.login_name <> 'sa' -- Exclude sa login
+AND r.session_id <> @@SPID -- Exclude current session
+AND r.session_id > 50 -- Exclude system sessions
+--AND r.wait_type like '%HADR_SYNC_COMMIT%'
+--AND r.session_id = 103
+ORDER BY 
+r.total_elapsed_time DESC;
