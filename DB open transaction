@@ -1,0 +1,2 @@
+dbcc opentran('tempdb') --on tempdb
+dbcc inputbuffer (sessionid example 408)
