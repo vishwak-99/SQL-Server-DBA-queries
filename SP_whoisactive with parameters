@@ -1,0 +1,26 @@
+EXEC sp_WhoIsActive
+    --@get_locks = 0,
+	--@get_transaction_info  = 0,
+	@show_sleeping_spids = 0,
+	@get_plans = 1,
+    @find_block_leaders = 0,
+    @sort_order = '[blocked_session_count] desc'
+Or
+
+EXEC sp_WhoIsActive 
+    @output_column_list = '[dd hh:mm:ss.mss], 
+    [session_id],
+    [blocking_session_id], 
+    [database_name], 
+    [sql_text], 
+    [wait_info],
+    [status],
+    [login_name], 
+    [CPU], 
+    [percent_complete], 
+    [host_name], 
+    [start_time], 
+    [query_plan],
+    [program_name]',
+    @show_sleeping_spids = 0,
+    @get_plans = 1
