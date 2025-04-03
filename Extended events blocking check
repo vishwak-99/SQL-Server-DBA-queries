@@ -1,0 +1,19 @@
+SELECT top 100
+   events.event_data.value('(event/@name)[1]', 'NVARCHAR(50)') AS event_name,
+   events.event_data.value('(event/data[@name="blocked_process"]/value)[1]', 'NVARCHAR(MAX)') AS blocked_process_report,
+   events.event_data.value('(/event/data[@name="blocked_process"]/value/blocked-process-report/blocked-process/process/@spid)[1]', 'INT') AS Blocked_Process_SPID,
+      events.event_data.value('(/event/data[@name="blocked_process"]/value/blocked-process-report/blocking-process/process/@spid)[1]', 'INT') AS Blocking_Process_SPID,
+      events.event_data.value('(/event/@timestamp)[1]', 'datetime') AS event_time
+      ,events.event_data
+FROM
+   (SELECT CAST(event_data AS XML) AS event_data
+    FROM sys.fn_xe_file_target_read_file(@filePath, NULL, NULL, NULL)) AS events
+CROSS APPLY
+   events.event_data.nodes('//event') AS XEvent(event_data)
+WHERE 1=1
+--and events.event_data.value('(/event/data[@name="blocked_process"]/value/blocked-process-report/blocking-process/process/@spid)[1]', 'INT') = 1350
+--and events.event_data.value('(/event/data[@name="blocked_process"]/value/blocked-process-report/blocked-process/process/@spid)[1]', 'INT') in (2761,3761)
+and events.event_data.value('(/event/@timestamp)[1]', 'datetime') between '2025-02-15 04:47:00' and '2025-02-15 05:00:00'--Time in UTC
+and (events.event_data.value('(event/data[@name="blocked_process"]/value)[1]', 'NVARCHAR(MAX)') like '%1044823430%' or events.event_data.value('(event/data[@name="blocked_process"]/value)[1]', 'NVARCHAR(MAX)') like '%Sp_name_keepithere')
+order by event_time
+ 
