@@ -1,0 +1,2 @@
+UPDATE STATISTICS [Dbname].[dbo].[tableNmae].[Indexnmae] 
+ WITH FULLSCAN, PERSIST_SAMPLE_PERCENT=ON
