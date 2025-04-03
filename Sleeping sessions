@@ -1,0 +1,6 @@
+select concat('kill ', spid),* from sys.sysprocesses
+
+where status = 'sleeping'
+and loginame like '%RD%'
+
+order by login_time desc;
