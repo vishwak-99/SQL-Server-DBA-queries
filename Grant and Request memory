@@ -1,0 +1,27 @@
+-- Select distinct sessions with memory grants and their details
+use master
+go
+SELECT DISTINCT
+qmg.session_id,
+job.job_id,
+CONVERT(varchar, DATEADD(ms, req.total_elapsed_time, 0), 108) AS [Duration_hh:mm:ss],
+ses.login_name,
+COALESCE(OBJECT_NAME(sqlt.objectid, sqlt.dbid), '') AS ProcName,
+DB_NAME(ses.database_id) AS dbname,
+req.wait_type,
+req.command,
+qmg.dop,
+(qmg.requested_memory_kb / 1024) AS MemoryRequestedMB,
+(qmg.granted_memory_kb / 1024) AS MemoryGrantedMB,
+(qmg.requested_memory_kb / 1024 / 1024) AS reqGB,
+sqlt.[text] AS QueryText
+FROM sys.dm_exec_query_memory_grants qmg
+CROSS APPLY sys.dm_exec_sql_text(qmg.sql_handle) sqlt
+INNER JOIN sys.dm_exec_requests req ON qmg.session_id = req.session_id
+INNER JOIN sys.dm_exec_sessions ses ON qmg.session_id = ses.session_id
+LEFT JOIN sys.dm_exec_background_job_queue job ON job.session_id = qmg.session_id
+-- Uncomment the following lines to filter by wait type or query text
+-- WHERE req.wait_type LIKE '%RESOURCE_SEMAPHORE%'
+-- AND sqlt.[text] LIKE '%rec%'
+ORDER BY MemoryRequestedMB DESC;
+
