@@ -1,0 +1,69 @@
+use DBname
+go
+
+WITH TableInfo AS (
+    SELECT 
+        t.name AS TableName, 
+        s.name AS SchemaName,  
+        o.create_date AS CreationDate
+    FROM 
+        sys.objects o 
+    INNER JOIN 
+        sys.tables t ON o.object_id = t.object_id
+    INNER JOIN 
+        sys.schemas s ON t.schema_id = s.schema_id  
+    WHERE 
+        o.type_desc = 'USER_TABLE'
+),
+TableRows AS (
+    SELECT 
+        t.name AS TableName, 
+        SUM(p.rows) AS TotalRows
+    FROM 
+        sys.tables t
+    JOIN 
+        sys.partitions p ON t.object_id = p.object_id 
+        AND p.index_id IN (0, 1)
+    GROUP BY 
+        t.name
+),
+TableSizes AS (
+    SELECT
+        t.name AS TableName,
+        SUM(a.used_pages) * 8.0 AS UsedSizeKB,
+        SUM(a.used_pages) * 8.0 / 1024 AS UsedSizeMB,
+        SUM(a.used_pages) * 8.0 / 1024 / 1024 AS UsedSizeGB
+    FROM 
+        sys.tables t
+    JOIN 
+        sys.partitions p ON t.object_id = p.object_id
+    JOIN 
+        sys.allocation_units a ON p.partition_id = a.container_id
+    GROUP BY 
+        t.name
+)
+SELECT 
+    ti.SchemaName,  
+    ti.TableName,
+    ti.CreationDate,
+    tr.TotalRows,
+    ts.UsedSizeKB,
+    ts.UsedSizeMB,
+    ts.UsedSizeGB
+FROM 
+    TableInfo ti
+JOIN 
+    TableRows tr ON ti.TableName = tr.TableName
+JOIN 
+    TableSizes ts ON ti.TableName = ts.TableName
+WHERE 
+    ti.TableName IN ('AL','AX','AP','AE','AT','A3','AT') and ti.SchemaName not in ('shecmanmae')
+ORDER BY 
+    CASE ti.TableName
+        WHEN 'AL' THEN 1
+        WHEN 'AX' THEN 2
+        
+        WHEN 'MG' THEN 3
+        ELSE 4  -- For any other tables not listed
+    END;
+	
