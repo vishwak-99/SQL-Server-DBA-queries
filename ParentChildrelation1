@@ -1,0 +1,63 @@
+WITH FK_Hierarchy
+AS (
+	SELECT t.object_id
+		,SCHEMA_NAME(t.schema_id) + '.' + t.name AS TableName
+		,0 AS LEVEL
+	FROM sys.tables t
+	WHERE NOT EXISTS (
+			SELECT 1
+			FROM sys.foreign_keys fk
+			WHERE fk.referenced_object_id = t.object_id
+			)
+	
+	UNION ALL
+	
+	SELECT t.object_id
+		,SCHEMA_NAME(t.schema_id) + '.' + t.name
+		,h.LEVEL + 1
+	FROM sys.tables t
+	JOIN sys.foreign_keys fk ON fk.referenced_object_id = t.object_id
+	JOIN FK_Hierarchy h ON fk.parent_object_id = h.object_id
+	)
+SELECT DISTINCT fh.TableName
+	,(
+		SELECT SUM(p.rows)
+		FROM sys.partitions p
+		WHERE p.object_id = fh.object_id
+			AND p.index_id <= 1
+		) AS [Row Count]
+	,MAX(fh.LEVEL) AS [Hierarchy Level]
+	,CASE 
+		WHEN MAX(fh.LEVEL) = 0
+			THEN 'Purge FIRST  (Child/Transaction)'
+		WHEN MAX(fh.LEVEL) = 1
+			THEN 'Purge SECOND (Mid Level)'
+		WHEN MAX(fh.LEVEL) = 2
+			THEN 'Purge THIRD  (Master/Parent)'
+		ELSE 'Purge LAST   (Lookup/Grandparent)'
+		END AS [Purge Order]
+	,(
+		SELECT SUM(a.total_pages) * 8 / 1024.0
+		FROM sys.indexes i
+		JOIN sys.partitions p ON i.object_id = p.object_id
+			AND i.index_id = p.index_id
+		JOIN sys.allocation_units a ON p.partition_id = a.container_id
+		WHERE i.object_id = fh.object_id
+		) AS [Table Size MB]
+FROM FK_Hierarchy fh
+GROUP BY fh.TableName
+	,fh.object_id
+ORDER BY [Hierarchy Level] DESC
+	,fh.TableName
+	/*
+
+-- Generate ALTER TABLE NOCHECK statements for foreign keys
+SELECT 
+    'ALTER TABLE ' + QUOTENAME(OBJECT_SCHEMA_NAME(fk.parent_object_id)) 
+    + '.' + QUOTENAME(OBJECT_NAME(fk.parent_object_id)) 
+    + ' NOCHECK CONSTRAINT ' + QUOTENAME(fk.name) AS DisableFKScript
+FROM sys.foreign_keys fk
+WHERE fk.is_disabled = 1 OR fk.is_not_trusted = 1;
+
+
+*/
