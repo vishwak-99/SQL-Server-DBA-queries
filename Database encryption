@@ -1,0 +1,66 @@
+SELECT @@servername,
+    concat(',','''',D.name,'''') AS [Database Name],
+    c.name AS [Cert Name],
+    E.encryptor_type AS [Type],
+    CASE
+        WHEN E.encryption_state = 3 THEN 'Encrypted'
+        WHEN E.encryption_state = 2 THEN 'In Progress'
+        ELSE 'Not Encrypted'
+    END AS [State],
+    E.encryption_state ,
+    E.percent_complete
+    --E.key_algorithm, 
+    --E.key_length, 
+    --E.*
+FROM 
+    sys.dm_database_encryption_keys E
+RIGHT JOIN 
+    sys.databases D ON D.database_id = E.database_id
+LEFT JOIN 
+    sys.certificates c ON E.encryptor_thumbprint = c.thumbprint
+WHERE 
+    D.database_id > 4 
+	--and E.encryption_state <>3
+	order by D.name
+
+	/*
+
+	DECLARE @DatabaseName NVARCHAR(128);
+DECLARE @SqlCommand NVARCHAR(MAX);
+
+-- Cursor to iterate through databases
+DECLARE db_cursor CURSOR FOR
+SELECT name
+FROM sys.databases
+WHERE name  IN (‘DBNames’
+)  -- Exclude system databases
+AND state_desc = 'ONLINE'; -- Consider only online databases
+
+OPEN db_cursor;
+FETCH NEXT FROM db_cursor INTO @DatabaseName;
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    -- Build the SQL command
+    SET @SqlCommand = N'
+    USE [' + @DatabaseName + ']
+	GO
+    CREATE DATABASE ENCRYPTION KEY
+    WITH ALGORITHM = AES_256
+    ENCRYPTION BY SERVER CERTIFICATE [MybackupCert1]  
+	GO
+    ALTER DATABASE [' + @DatabaseName + '] SET ENCRYPTION ON
+	GO'
+	;
+
+    PRINT @SqlCommand;
+
+    FETCH NEXT FROM db_cursor INTO @DatabaseName;
+END
+
+-- Close and deallocate the cursor
+CLOSE db_cursor;
+DEALLOCATE db_cursor;
+
+
+*/
