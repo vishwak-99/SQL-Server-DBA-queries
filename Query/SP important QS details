@@ -1,0 +1,179 @@
+-- Step 1: Retrieve the main query details with explicit conversions
+WITH MainQuery AS (
+    SELECT
+        p.plan_id,
+        p.is_forced_plan AS plan_forced,
+        CAST(rs.last_execution_time AS DATE) AS theday,
+        p.query_id,
+        q.object_id,
+        ISNULL(OBJECT_NAME(q.object_id), '') AS object_name,
+        qt.query_sql_text,
+
+        -- Execution Metrics
+        SUM(rs.count_executions) AS exec_count,
+        SUM(CASE WHEN rs.execution_type = 3 THEN rs.count_executions ELSE 0 END) AS timeout_count,
+        SUM(CASE WHEN rs.execution_type = 1 THEN rs.count_executions ELSE 0 END) AS exception_count,
+        CASE WHEN SUM(CASE WHEN rs.execution_type = 3 THEN 1 ELSE 0 END) > 0 THEN 'Yes' ELSE 'No' END AS had_timeout,
+        CASE WHEN SUM(CASE WHEN rs.execution_type = 1 THEN 1 ELSE 0 END) > 0 THEN 'Yes' ELSE 'No' END AS had_exception,
+
+        -- Duration Metrics with explicit conversion
+        ROUND(CONVERT(float, MIN(rs.min_duration)) * 0.001, 2) AS min_duration_ms,
+        ROUND(CONVERT(float, MAX(rs.max_duration)) * 0.001, 2) AS max_duration_ms,
+        ROUND(CONVERT(float, AVG(rs.avg_duration)) * 0.001, 2) AS avg_duration_ms,
+        ROUND(CONVERT(float, STDEV(rs.avg_duration)) * 0.001, 2) AS std_dev_duration_ms,
+        ROUND(CONVERT(float, AVG(rs.avg_duration) * SUM(rs.count_executions)) * 0.001, 2) AS total_duration_ms,
+        ROUND(CONVERT(float, MAX(CASE WHEN rs.execution_type = 3 THEN rs.max_duration ELSE NULL END)) * 0.001, 2) AS timeout_max_duration_ms,
+
+        -- Ratio Metric
+        ROUND(
+            ROUND(CONVERT(float, AVG(rs.avg_duration)) * 0.001, 2) /
+            CASE 
+                WHEN ROUND(CONVERT(float, MAX(rs.avg_rowcount)), 0) = 0 THEN 1 
+                ELSE ROUND(CONVERT(float, MAX(rs.avg_rowcount)), 0) 
+            END, 2
+        ) AS avg_ms_Per_Row_Ratio,
+
+        -- Resource Metrics
+        ROUND(CONVERT(float, AVG(rs.avg_cpu_time)) * 0.001, 2) AS avg_cpu_time_ms,
+        ROUND(CONVERT(float, MAX(rs.max_cpu_time)) * 0.001, 2) AS max_cpu_time_ms,
+        ROUND(CONVERT(float, MAX(rs.max_logical_io_reads)) * 8, 2) AS max_logical_io_reads_kb,
+        ROUND(CONVERT(float, MAX(rs.max_logical_io_writes)) * 8, 2) AS max_logical_io_writes_kb,
+        ROUND(CONVERT(float, MAX(rs.max_physical_io_reads)) * 8, 2) AS max_physical_io_reads_kb,
+        ROUND(CONVERT(float, MAX(rs.max_clr_time)) * 0.001, 2) AS max_clr_time_ms,
+
+        -- Execution Context
+        MIN(rs.first_execution_time) AS first_execution_time,
+        MAX(rs.last_execution_time) AS last_execution_time,
+        ROUND(CONVERT(float, MAX(rs.max_dop)), 0) AS max_dop,
+        ROUND(CONVERT(float, MAX(rs.max_query_max_used_memory)) * 8, 2) AS max_query_max_used_memory_kb,
+
+        -- Row Count Metrics
+        ROUND(CONVERT(float, MAX(rs.avg_rowcount)), 0) AS avg_rowcount,
+        ROUND(CONVERT(float, MAX(rs.max_rowcount)), 0) AS max_rowcount,
+
+        -- Plan Information
+        COUNT(DISTINCT p.plan_id) AS num_plans
+
+    FROM sys.query_store_runtime_stats rs
+    JOIN sys.query_store_plan p ON rs.plan_id = p.plan_id
+    JOIN sys.query_store_query q ON p.query_id = q.query_id
+    JOIN sys.query_store_query_text qt ON q.query_text_id = qt.query_text_id
+    GROUP BY 
+        p.plan_id, 
+        p.is_forced_plan, 
+        p.query_id, 
+        q.object_id, 
+        qt.query_sql_text, 
+        CAST(rs.last_execution_time AS DATE)
+)
+
+-- Step 2: Retrieve the query plan separately
+SELECT
+    mq.*,
+    pd.Execution_plan
+FROM MainQuery mq
+JOIN (
+    SELECT
+        p.plan_id,
+        TRY_CAST(p.query_plan AS XML) AS Execution_plan
+    FROM sys.query_store_plan p
+) pd ON mq.plan_id = pd.plan_id
+ORDER BY 
+    mq.last_execution_time DESC, 
+    mq.theday DESC, 
+    mq.query_id;
+/*
+
+-- Step 1: Retrieve the main query details with explicit conversions
+WITH MainQuery AS (
+    SELECT
+        p.plan_id,
+        p.is_forced_plan AS plan_forced,
+        CAST(rs.last_execution_time AS DATE) AS theday,
+        p.query_id,
+        q.object_id,
+        ISNULL(OBJECT_NAME(q.object_id), '') AS object_name,
+    CAST(CONVERT(int, MAX(rs.max_duration)) * 0.001 - CONVERT(float, SUM(rs.count_executions)) AS INT) AS diff_max_duration_exec_count,
+    SUM(rs.count_executions) AS exec_count,
+        ROUND(CONVERT(float, MAX(rs.max_duration)) * 0.001, 2) AS max_duration_ms,
+ 
+     
+
+
+
+-- Execution Metrics
+
+
+        SUM(CASE WHEN rs.execution_type = 3 THEN rs.count_executions ELSE 0 END) AS timeout_count,
+        SUM(CASE WHEN rs.execution_type = 1 THEN rs.count_executions ELSE 0 END) AS exception_count,
+        CASE WHEN SUM(CASE WHEN rs.execution_type = 3 THEN 1 ELSE 0 END) > 0 THEN 'Yes' ELSE 'No' END AS had_timeout,
+        CASE WHEN SUM(CASE WHEN rs.execution_type = 1 THEN 1 ELSE 0 END) > 0 THEN 'Yes' ELSE 'No' END AS had_exception,
+
+        -- Duration Metrics with explicit conversion
+        ROUND(CONVERT(float, MIN(rs.min_duration)) * 0.001, 2) AS min_duration_ms,
+        ROUND(CONVERT(float, AVG(rs.avg_duration)) * 0.001, 2) AS avg_duration_ms,
+        ROUND(CONVERT(float, STDEV(rs.avg_duration)) * 0.001, 2) AS std_dev_duration_ms,
+        ROUND(CONVERT(float, AVG(rs.avg_duration) * SUM(rs.count_executions)) * 0.001, 2) AS total_duration_ms,
+        ROUND(CONVERT(float, MAX(CASE WHEN rs.execution_type = 3 THEN rs.max_duration ELSE NULL END)) * 0.001, 2) AS timeout_max_duration_ms,
+
+        -- Ratio Metric
+        ROUND(
+            ROUND(CONVERT(float, AVG(rs.avg_duration)) * 0.001, 2) /
+            CASE 
+                WHEN ROUND(CONVERT(float, MAX(rs.avg_rowcount)), 0) = 0 THEN 1 
+                ELSE ROUND(CONVERT(float, MAX(rs.avg_rowcount)), 0) 
+            END, 2
+        ) AS avg_ms_Per_Row_Ratio,
+
+        -- Resource Metrics
+        ROUND(CONVERT(float, AVG(rs.avg_cpu_time)) * 0.001, 2) AS avg_cpu_time_ms,
+        ROUND(CONVERT(float, MAX(rs.max_cpu_time)) * 0.001, 2) AS max_cpu_time_ms,
+        ROUND(CONVERT(float, MAX(rs.max_logical_io_reads)) * 8, 2) AS max_logical_io_reads_kb,
+        ROUND(CONVERT(float, MAX(rs.max_logical_io_writes)) * 8, 2) AS max_logical_io_writes_kb,
+        ROUND(CONVERT(float, MAX(rs.max_physical_io_reads)) * 8, 2) AS max_physical_io_reads_kb,
+        ROUND(CONVERT(float, MAX(rs.max_clr_time)) * 0.001, 2) AS max_clr_time_ms,
+
+        -- Execution Context
+        MIN(rs.first_execution_time) AS first_execution_time,
+        MAX(rs.last_execution_time) AS last_execution_time,
+        ROUND(CONVERT(float, MAX(rs.max_dop)), 0) AS max_dop,
+        ROUND(CONVERT(float, MAX(rs.max_query_max_used_memory)) * 8, 2) AS max_query_max_used_memory_kb,
+
+        -- Row Count Metrics
+        ROUND(CONVERT(float, MAX(rs.avg_rowcount)), 0) AS avg_rowcount,
+        ROUND(CONVERT(float, MAX(rs.max_rowcount)), 0) AS max_rowcount,
+
+        -- Plan Information
+        COUNT(DISTINCT p.plan_id) AS num_plans
+
+    FROM sys.query_store_runtime_stats rs
+    JOIN sys.query_store_plan p ON rs.plan_id = p.plan_id
+    JOIN sys.query_store_query q ON p.query_id = q.query_id
+    JOIN sys.query_store_query_text qt ON q.query_text_id = qt.query_text_id
+    GROUP BY 
+        p.plan_id, 
+        p.is_forced_plan, 
+        p.query_id, 
+        q.object_id, 
+        qt.query_sql_text, 
+        CAST(rs.last_execution_time AS DATE)
+)
+
+-- Step 2: Retrieve the query plan separately
+SELECT
+    mq.*,
+    pd.Execution_plan
+FROM MainQuery mq
+JOIN (
+    SELECT
+        p.plan_id,
+        TRY_CAST(p.query_plan AS XML) AS Execution_plan
+    FROM sys.query_store_plan p
+) pd ON mq.plan_id = pd.plan_id
+ORDER BY 
+    --mq.max_duration_ms desc,
+    --mq.last_execution_time DESC,
+  mq.exec_count desc,
+    mq.theday DESC, 
+    mq.query_id;
+*/
