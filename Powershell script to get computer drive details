@@ -1,0 +1,24 @@
+$volumes = Get-Volume | Where-Object { $_.FileSystem -ne $null }
+ 
+$volumeInfo = foreach ($volume in $volumes) {
+    try {
+        $size = [math]::Round($volume.Size / 1GB, 2)
+        $free = [math]::Round($volume.SizeRemaining / 1GB, 2)
+        $used = [math]::Round(($volume.Size - $volume.SizeRemaining) / 1GB, 2)
+        
+        [PSCustomObject]@{
+            'Drive'       = $volume.DriveLetter
+            'FileSystem'  = $volume.FileSystem
+            'Label'       = $volume.FileSystemLabel
+           'Used(GB)'    = $used
+           # 'Free(GB)'    = $free
+            'Total(GB)'   = $size
+        }
+    }
+    catch {
+        Write-Warning "Could not retrieve size for volume $($volume.DriveLetter): $_"
+    }
+}
+ 
+# Sort by Label and display in tabular format
+$volumeInfo | Sort-Object -Property Label | Format-Table -AutoSize
