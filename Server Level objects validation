@@ -1,0 +1,347 @@
+DECLARE
+  @AuthenticationMode INT,
+
+          @TcpPort NVARCHAR(10),
+
+          @TcpDynamicPorts NVARCHAR(10);
+
+  -- Read Authentication Mode
+
+  EXEC master.dbo.xp_instance_regread 
+
+      N'HKEY_LOCAL_MACHINE', 
+
+      N'Software\Microsoft\MSSQLServer\MSSQLServer', 
+
+      N'LoginMode', 
+
+      @AuthenticationMode OUTPUT;
+
+  -- Read TCP Port
+
+  EXEC master.dbo.xp_instance_regread 
+
+      N'HKEY_LOCAL_MACHINE', 
+
+     
+  N'Software\Microsoft\MSSQLServer\MSSQLServer\SuperSocketNetLib\Tcp\IPAll', 
+
+      N'TcpPort', 
+
+      @TcpPort OUTPUT;
+
+  -- Read TCP Dynamic Ports
+
+  EXEC master.dbo.xp_instance_regread 
+
+      N'HKEY_LOCAL_MACHINE', 
+
+     
+  N'Software\Microsoft\MSSQLServer\MSSQLServer\SuperSocketNetLib\Tcp\IPAll', 
+
+      N'TcpDynamicPorts', 
+
+      @TcpDynamicPorts OUTPUT;
+
+  -- Declare a table variable to store DBCC TRACESTATUS output
+
+  DECLARE @TraceStatus TABLE (
+
+      TraceFlag INT,
+
+      Status BIT,
+
+      Global BIT,
+
+      Session BIT
+
+  );
+
+  -- Insert the output of DBCC TRACESTATUS (-1) into the table variable
+
+  INSERT INTO @TraceStatus (TraceFlag, Status, Global, Session)
+
+  EXEC sp_executesql N'DBCC TRACESTATUS(-1) WITH NO_INFOMSGS';
+
+  -- Get the count of enabled and disabled trace flags
+
+  DECLARE @TraceStatusCounts NVARCHAR(50);
+
+  SELECT 
+
+      @TraceStatusCounts = 'Enabled: ' + CAST(SUM(CASE WHEN Status =
+  1 THEN 1 ELSE 0 END) AS VARCHAR(10)) + 
+
+                       
+     ', Disabled: ' + CAST(SUM(CASE WHEN Status = 0 THEN 1 ELSE 0
+  END) AS VARCHAR(10))
+
+  FROM @TraceStatus;
+
+  -- Main query
+
+  SELECT 
+
+      COALESCE(CONVERT(VARCHAR(50), ServerName), '') AS ServerName,
+
+      COALESCE(CONVERT(VARCHAR(50), InstanceName), '') AS
+  InstanceName,
+
+      COALESCE(CONVERT(VARCHAR(50), TotalUserDBs), '') AS
+  TotalUserDBs,
+
+      COALESCE(CONVERT(INT, TotalLogins), 0) AS TotalLogins,
+
+      COALESCE(CONVERT(INT, DisabledLogins), 0) AS DisabledLogins,
+
+      COALESCE(CONVERT(INT, EnabledLogins), 0) AS EnabledLogins,
+
+      COALESCE(CONVERT(INT, TotalCredentials), 0) AS
+  TotalCredentials,
+
+      COALESCE(CONVERT(INT, TotalLinkedServers), 0) AS
+  TotalLinkedServers,
+
+      COALESCE(CONVERT(VARCHAR(MAX), LinkedServerNames), '') AS
+  LinkedServerNames,
+
+      '' AS [Linked Server Connection status],
+
+      COALESCE(CONVERT(INT, TotalJobs), 0) AS TotalJobs,
+
+      COALESCE(CONVERT(INT, EnabledJobs), 0) AS EnabledJobs,
+
+      COALESCE(CONVERT(INT, DisabledJobs), 0) AS DisabledJobs,
+
+      COALESCE(CONVERT(INT, ScheduledJobsCount), 0) AS
+  ScheduledJobsCount,
+
+      COALESCE(CONVERT(INT, EnabledScheduledJobsCount), 0) AS
+  EnabledScheduledJobsCount,
+
+      COALESCE(CONVERT(INT, DisabledScheduledJobsCount), 0) AS
+  DisabledScheduledJobsCount,
+
+      COALESCE(CONVERT(VARCHAR(MAX), DisabledScheduledJobsList), '')
+  AS DisabledScheduledJobsList,
+
+      COALESCE(CONVERT(INT, TotalMaintenancePlans), 0) AS
+  TotalMaintenancePlans,
+
+      COALESCE(CONVERT(INT, EncryptedDBs), 0) AS EncryptedDBs,
+
+      COALESCE(CONVERT(INT, ServerAuditCount), 0) AS
+  ServerAuditCount,
+
+      COALESCE(CONVERT(INT, AuditSpecCount), 0) AS AuditSpecCount,
+
+      COALESCE(CONVERT(INT, DBAuditCount), 0) AS DBAuditCount,
+
+      COALESCE(CONVERT(INT, ExtendedEventsCount), 0) AS
+  ExtendedEventsCount,
+
+      COALESCE(CONVERT(INT, MailProfiles), 0) AS MailProfiles,
+
+      COALESCE(CONVERT(INT, MailAccounts), 0) AS MailAccounts,
+
+      COALESCE(CONVERT(VARCHAR(100), SQLServerVersion), '') AS
+  SQLServerVersion,
+
+      COALESCE(CONVERT(VARCHAR(20), SQLServerEdition), '') AS
+  SQLServerEdition,
+
+      COALESCE(CONVERT(VARCHAR(10), Collation), '') AS Collation,
+
+      COALESCE(CONVERT(VARCHAR(20), MaxMemory_MB), '') AS
+  MaxMemory_MB,
+
+      CASE @AuthenticationMode 
+
+          WHEN 1 THEN 'Windows Authentication' 
+
+          WHEN 2 THEN 'Windows and SQL Server
+  Authentication' 
+
+          ELSE 'Unknown' 
+
+      END AS [Authentication Mode],
+
+      CASE 
+
+          WHEN @TcpPort IS NOT NULL AND @TcpPort <>
+  '' THEN @TcpPort + ' (Static Port)'
+
+          WHEN @TcpDynamicPorts IS NOT NULL AND
+  @TcpDynamicPorts <> '' THEN @TcpDynamicPorts + ' (Dynamic Port)'
+
+          ELSE 'Not Set'
+
+      END AS PortNumber,
+
+      @TraceStatusCounts AS TraceStatusCounts,
+
+      '' AS [Replicate SQL configurations (sp_configure)]
+
+  FROM (
+
+      SELECT
+
+          SERVERPROPERTY('MachineName') AS ServerName,
+
+          SERVERPROPERTY('ServerName') AS InstanceName,
+
+          SERVERPROPERTY('ProductVersion') AS
+  SQLServerVersion,
+
+          SERVERPROPERTY('Edition') AS SQLServerEdition,
+
+          SERVERPROPERTY('Collation') AS Collation,
+
+          (SELECT value_in_use FROM sys.configurations
+  WHERE name = 'max server memory (MB)') AS MaxMemory_MB
+
+  ) AS ServerInfo
+
+  CROSS JOIN (
+
+      SELECT 
+
+          'Online: ' + CAST(SUM(CASE WHEN state_desc =
+  'ONLINE' THEN 1 ELSE 0 END) AS VARCHAR(10)) +
+
+          ', Offline: ' + CAST(SUM(CASE WHEN state_desc =
+  'OFFLINE' THEN 1 ELSE 0 END) AS VARCHAR(10)) AS TotalUserDBs
+
+      FROM sys.databases 
+
+      WHERE database_id > 4
+
+  ) AS UserDBInfo
+
+  CROSS JOIN (
+
+      SELECT 
+
+          COUNT(distinct sid) AS TotalLogins,
+
+          SUM(CASE WHEN is_disabled = 1 THEN 1 ELSE 0 END)
+  AS DisabledLogins,
+
+          SUM(CASE WHEN is_disabled = 0 THEN 1 ELSE 0 END)
+  AS EnabledLogins
+
+      FROM sys.server_principals WHERE type IN ('S', 'U', 'G')
+
+  ) AS SecurityInfo
+
+  CROSS JOIN (
+
+      SELECT 
+
+          (SELECT COUNT(*) FROM sys.credentials) AS
+  TotalCredentials,
+
+          COUNT(*) AS TotalLinkedServers,
+
+          STUFF((SELECT ', ' + name FROM sys.servers WHERE
+  is_linked = 1 FOR XML PATH(''), TYPE).value('.', 'VARCHAR(MAX)'), 1, 2, '')
+  AS LinkedServerNames
+
+      FROM sys.servers WHERE is_linked = 1
+
+  ) AS LinkedInfo
+
+  CROSS JOIN (
+
+SELECT
+    COUNT(DISTINCT j.job_id) AS TotalJobs,
+    COUNT(DISTINCT CASE WHEN j.enabled = 1 THEN j.job_id END) AS EnabledJobs,
+    COUNT(DISTINCT CASE WHEN j.enabled = 0 THEN j.job_id END) AS DisabledJobs,
+    COUNT(DISTINCT CASE WHEN js.schedule_id IS NOT NULL THEN j.job_id END) AS ScheduledJobsCount,
+    COUNT(DISTINCT CASE WHEN j.enabled = 1 AND js.schedule_id IS NOT NULL THEN j.job_id END) AS EnabledScheduledJobsCount,
+    COUNT(DISTINCT CASE WHEN j.enabled = 0 AND js.schedule_id IS NOT NULL THEN j.job_id END) AS DisabledScheduledJobsCount,
+    (
+        SELECT STUFF((
+            SELECT ', ' + j2.name
+            FROM msdb.dbo.sysjobs j2
+            LEFT JOIN msdb.dbo.sysjobschedules js2 ON j2.job_id = js2.job_id
+            WHERE j2.enabled = 0 AND j2.category_id <> 1
+            GROUP BY j2.name
+            FOR XML PATH(''), TYPE
+        ).value('.', 'VARCHAR(MAX)'), 1, 2, '')
+    ) AS DisabledScheduledJobsList
+FROM msdb.dbo.sysjobs j
+LEFT JOIN msdb.dbo.sysjobschedules js ON j.job_id = js.job_id
+
+  ) AS JobInfo
+
+  CROSS JOIN (
+
+      SELECT COUNT(*) AS TotalMaintenancePlans FROM
+  msdb.dbo.sysmaintplan_plans
+
+  ) AS MaintenanceInfo
+
+  CROSS JOIN (
+
+      SELECT COUNT(*) AS EncryptedDBs FROM
+  sys.dm_database_encryption_keys
+
+  ) AS EncryptedInfo
+
+  CROSS JOIN (
+
+      SELECT 
+
+          CASE WHEN EXISTS (SELECT * FROM
+  sys.configurations WHERE name = 'common criteria compliance enabled' AND
+  value_in_use = 1)
+
+               THEN (SELECT COUNT(*) FROM
+  sys.server_audits) ELSE 0 END AS ServerAuditCount,
+
+          CASE WHEN EXISTS (SELECT * FROM
+  sys.configurations WHERE name = 'common criteria compliance enabled' AND
+  value_in_use = 1)
+
+               THEN (SELECT COUNT(*) FROM
+  sys.server_audit_specifications) ELSE 0 END AS AuditSpecCount,
+
+          CASE WHEN EXISTS (SELECT * FROM
+  sys.configurations WHERE name = 'common criteria compliance enabled' AND
+  value_in_use = 1)
+
+               THEN (SELECT COUNT(*) FROM
+  sys.database_audit_specifications) ELSE 0 END AS DBAuditCount
+
+  ) AS AuditInfo
+
+  CROSS JOIN (
+
+      SELECT COUNT(*) AS ExtendedEventsCount FROM
+  sys.server_event_sessions WHERE name NOT IN ('system_health',
+  'telemetry_xevents', 'AlwaysOn_health')
+
+  ) AS ExtendedEventsInfo
+
+  CROSS JOIN (
+
+     -- Mail Configuration
+
+      SELECT
+
+          COUNT(DISTINCT p.profile_id) AS MailProfiles,
+
+          COUNT(DISTINCT a.account_id) AS MailAccounts
+
+      FROM msdb.dbo.sysmail_profile p
+
+      JOIN msdb.dbo.sysmail_profileaccount pa ON p.profile_id =
+  pa.profile_id
+
+      JOIN msdb.dbo.sysmail_account a ON pa.account_id = a.account_id
+
+  ) AS MailInfo;
+
+--DBCC TRACESTATUS(-1)
+--select @@version
