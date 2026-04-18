@@ -1,0 +1,41 @@
+DECLARE @DatabaseName NVARCHAR(128)
+DECLARE @SQL NVARCHAR(MAX)
+
+-- Cursor to iterate over all user databases (excluding system databases)
+DECLARE db_cursor CURSOR FOR
+SELECT name 
+FROM sys.databases 
+WHERE name NOT IN ('master', 'tempdb', 'model', 'msdb' ) -- Exclude system databases
+AND state_desc = 'ONLINE' -- Ensure database is online
+
+OPEN db_cursor
+FETCH NEXT FROM db_cursor INTO @DatabaseName
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    -- Construct the SQL statement for creating the audit specification
+    SET @SQL = 'USE [' + @DatabaseName + '];' + CHAR(13) + CHAR(10) + 'GO'+ CHAR(13) + CHAR(10) +
+               'CREATE DATABASE AUDIT SPECIFICATION [DatabaseAuditSpecification-20210708-193601]' + CHAR(13) + CHAR(10) +
+               'FOR SERVER AUDIT [AuditsQLDB]' + CHAR(13) + CHAR(10) +
+
+'ADD (AUDIT_CHANGE_GROUP),'+CHAR(13) + CHAR(10) +
+'ADD (DATABASE_OBJECT_PERMISSION_CHANGE_GROUP),'+CHAR(13) + CHAR(10) +
+'ADD (SCHEMA_OBJECT_PERMISSION_CHANGE_GROUP),'+CHAR(13) + CHAR(10) +
+'ADD (DATABASE_CHANGE_GROUP),'+CHAR(13) + CHAR(10) +
+'ADD (DATABASE_OBJECT_CHANGE_GROUP),'+CHAR(13) + CHAR(10) +
+'ADD (SCHEMA_OBJECT_CHANGE_GROUP),'+CHAR(13) + CHAR(10) +
+'ADD (DATABASE_OBJECT_OWNERSHIP_CHANGE_GROUP),'+CHAR(13) + CHAR(10) +
+'ADD (SCHEMA_OBJECT_OWNERSHIP_CHANGE_GROUP)'+CHAR(13) + CHAR(10) +
+'WITH (STATE = ON)' +CHAR(13) + CHAR(10) 
+
+         + 'GO'
+
+    -- Print the SQL statement
+    PRINT @SQL
+
+    FETCH NEXT FROM db_cursor INTO @DatabaseName
+END
+
+CLOSE db_cursor
+DEALLOCATE db_cursor
+ 
