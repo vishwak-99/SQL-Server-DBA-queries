@@ -1,0 +1,4 @@
+SELECT m.* INTO dba.dbo.backupTable 
+FROM TableName1 M 
+JOIN TableName2 a on m.col1=a.col2
+where m.col1in (123)
