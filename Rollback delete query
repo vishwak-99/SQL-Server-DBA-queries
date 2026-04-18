@@ -1,0 +1,4 @@
+insert into TableName (
+Col1,col2) 
+select 
+col1,col2 from DBname.dbo.TableNamebackup
