@@ -1,0 +1,61 @@
+SELECT  
+    name, 
+    minimum, 
+    maximum, 
+    value_in_use,  
+    CASE is_dynamic 
+        WHEN 1 THEN 'reconfigure with override' 
+        WHEN 0 THEN 'restart'
+    END AS [APPLY]
+INTO #configurations
+FROM sys.configurations;
+ 
+SELECT 
+    'sp_configure ''' + RTRIM(name) + ''', ' + CONVERT(VARCHAR, value_in_use) + CHAR(13) + CHAR(10) + 'GO' + CHAR(13) + CHAR(10) +
+    CASE [APPLY] 
+        WHEN 'restart' THEN '-- Please restart SQL services' + CHAR(13) + CHAR(10) + 'GO' 
+        ELSE 'reconfigure with override' + CHAR(13) + CHAR(10) + 'GO'  
+    END AS sql_text
+INTO #configurations_final 
+FROM #configurations;
+ 
+IF EXISTS (SELECT 1 FROM sys.configurations WHERE value_in_use <> 0 AND is_dynamic = 0)
+BEGIN
+    INSERT INTO #configurations_final 
+    VALUES ('SELECT ''IMP NOTE: One of the configuration options needs SQL Server restart to get activated''');
+END
+ 
+SELECT 
+    RowNum = ROW_NUMBER() OVER (ORDER BY sql_text DESC),
+    *
+INTO #Geo
+FROM #configurations_final;
+ 
+DECLARE @MaxRownum INT;
+SET @MaxRownum = (SELECT MAX(RowNum) FROM #Geo);
+ 
+DECLARE @Iter INT;
+SET @Iter = 1;
+DECLARE @sql_text VARCHAR(2000);
+SET @sql_text = '';
+SET @Iter = (SELECT MIN(RowNum) FROM #Geo);
+ 
+CREATE TABLE #final (sql_text VARCHAR(2000));
+ 
+WHILE @Iter <= @MaxRownum
+BEGIN
+    INSERT INTO #final  
+    SELECT sql_text 
+    FROM #Geo
+    WHERE RowNum = @Iter;
+ 
+    SET @Iter = @Iter + 1;
+END
+ 
+SELECT * FROM #final;
+ 
+DROP TABLE #configurations;
+DROP TABLE #configurations_final;
+DROP TABLE #Geo;
+DROP TABLE #final;
+ 
