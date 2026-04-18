@@ -1,0 +1,269 @@
+;WITH CTE_FK AS (
+    SELECT 
+        -- Child table (has the FK column)
+        CONCAT(OBJECT_SCHEMA_NAME(FK.parent_object_id), '.',
+               OBJECT_NAME(FK.parent_object_id))            AS ChildTable,
+
+        -- Parent table (being referenced)
+        CONCAT(OBJECT_SCHEMA_NAME(FK.referenced_object_id), '.',
+               OBJECT_NAME(FK.referenced_object_id))        AS ParentTable,
+
+        -- FK constraint name
+        FK.name                                             AS FK_ConstraintName,
+
+        -- FK column in child table
+        cf.name                                             AS ChildTable_FKColumn,
+
+        -- PK column in parent table
+        c.name                                              AS ParentTable_PKColumn
+
+    FROM sys.foreign_keys AS FK
+    INNER JOIN sys.foreign_key_columns AS FKC
+        ON FK.OBJECT_ID              = FKC.constraint_object_id
+    INNER JOIN sys.columns c
+        ON c.OBJECT_ID               = FKC.referenced_object_id
+        AND c.column_id              = FKC.referenced_column_id
+    INNER JOIN sys.columns cf
+        ON cf.OBJECT_ID              = FKC.parent_object_id
+        AND cf.column_id             = FKC.parent_column_id
+),
+
+-- ================================================================
+-- Level 1: Child → Parent relationship
+-- ================================================================
+CTE_Level1 AS (
+    SELECT DISTINCT
+         ChildTable                                         AS [L1_ChildTable]
+        ,ParentTable                                        AS [L1_ParentTable]
+        ,FK_ConstraintName                                  AS [L1_FK_Name]
+        ,STUFF((
+            SELECT ',' + i.ChildTable_FKColumn
+            FROM CTE_FK i
+            WHERE i.FK_ConstraintName = o.FK_ConstraintName
+              AND i.ChildTable        = o.ChildTable
+              AND i.ParentTable       = o.ParentTable
+            FOR XML PATH('')
+         ), 1, 1, '')                                       AS [L1_ChildFK_Column]
+        ,STUFF((
+            SELECT ',' + i.ParentTable_PKColumn
+            FROM CTE_FK i
+            WHERE i.FK_ConstraintName = o.FK_ConstraintName
+              AND i.ChildTable        = o.ChildTable
+              AND i.ParentTable       = o.ParentTable
+            FOR XML PATH('')
+         ), 1, 1, '')                                       AS [L1_ParentPK_Column]
+    FROM CTE_FK o
+),
+
+-- ================================================================
+-- Level 2: Parent → GrandParent relationship
+-- ================================================================
+CTE_Level2 AS (
+    SELECT DISTINCT
+         child.L1_ChildTable
+        ,child.L1_ParentTable
+        ,child.L1_FK_Name
+        ,child.L1_ChildFK_Column
+        ,child.L1_ParentPK_Column
+
+        -- GrandParent details
+        ,parent.L1_ParentTable                              AS [L2_GrandParentTable]
+        ,parent.L1_FK_Name                                  AS [L2_FK_Name]
+        ,parent.L1_ChildFK_Column                           AS [L2_ParentFK_Column]
+        ,parent.L1_ParentPK_Column                          AS [L2_GrandParentPK_Column]
+
+    FROM CTE_Level1                  child
+    LEFT JOIN CTE_Level1             parent
+        ON child.L1_ParentTable      = parent.L1_ChildTable
+),
+
+-- ================================================================
+-- Level 3: GrandParent → GreatGrandParent relationship
+-- ================================================================
+CTE_Level3 AS (
+    SELECT DISTINCT
+         l2.L1_ChildTable
+        ,l2.L1_ParentTable
+        ,l2.L1_FK_Name
+        ,l2.L1_ChildFK_Column
+        ,l2.L1_ParentPK_Column
+        ,l2.L2_GrandParentTable
+        ,l2.L2_FK_Name
+        ,l2.L2_ParentFK_Column
+        ,l2.L2_GrandParentPK_Column
+
+        -- GreatGrandParent details
+        ,gp.L1_ParentTable                                  AS [L3_GreatGrandParentTable]
+        ,gp.L1_FK_Name                                      AS [L3_FK_Name]
+        ,gp.L1_ChildFK_Column                               AS [L3_GrandParentFK_Column]
+        ,gp.L1_ParentPK_Column                              AS [L3_GreatGrandParentPK_Column]
+
+    FROM CTE_Level2                  l2
+    LEFT JOIN CTE_Level1             gp
+        ON l2.L2_GrandParentTable    = gp.L1_ChildTable
+),
+
+-- ================================================================
+-- Level 4: GreatGrandParent → GreatGreatGrandParent relationship
+-- ================================================================
+CTE_Level4 AS (
+    SELECT DISTINCT
+         l3.L1_ChildTable
+        ,l3.L1_ParentTable
+        ,l3.L1_FK_Name
+        ,l3.L1_ChildFK_Column
+        ,l3.L1_ParentPK_Column
+        ,l3.L2_GrandParentTable
+        ,l3.L2_FK_Name
+        ,l3.L2_ParentFK_Column
+        ,l3.L2_GrandParentPK_Column
+        ,l3.L3_GreatGrandParentTable
+        ,l3.L3_FK_Name
+        ,l3.L3_GrandParentFK_Column
+        ,l3.L3_GreatGrandParentPK_Column
+
+        -- GreatGreatGrandParent details
+        ,ggp.L1_ParentTable                                 AS [L4_GreatGreatGrandParentTable]
+        ,ggp.L1_FK_Name                                     AS [L4_FK_Name]
+        ,ggp.L1_ChildFK_Column                              AS [L4_GreatGrandParentFK_Column]
+        ,ggp.L1_ParentPK_Column                             AS [L4_GreatGreatGrandParentPK_Column]
+
+    FROM CTE_Level3                  l3
+    LEFT JOIN CTE_Level1             ggp
+        ON l3.L3_GreatGrandParentTable = ggp.L1_ChildTable
+)
+
+-- ================================================================
+-- FINAL SELECT — All 4 levels in one clean readable output
+-- ================================================================
+SELECT
+    -- ============================================================
+    -- LEVEL 1 — Child (Transaction Table)
+    -- ============================================================
+     l4.L1_ChildTable
+        AS [L1 — Child Table (Has FK)],
+
+     l4.L1_ChildFK_Column
+        AS [L1 — Child FK Column],
+
+     l4.L1_FK_Name
+        AS [L1 — FK Constraint Name],
+
+    -- ============================================================
+    -- LEVEL 2 — Parent (Master Table)
+    -- ============================================================
+     l4.L1_ParentTable
+        AS [L2 — Parent Table (Referenced by Child)],
+
+     l4.L1_ParentPK_Column
+        AS [L2 — Parent PK Column],
+
+     ISNULL(l4.L2_FK_Name, '— No FK —')
+        AS [L2 — Parent FK Constraint Name],
+
+    -- ============================================================
+    -- LEVEL 3 — GrandParent
+    -- ============================================================
+     ISNULL(l4.L2_GrandParentTable, '— No GrandParent —')
+        AS [L3 — GrandParent Table],
+
+     ISNULL(l4.L2_GrandParentPK_Column, '—')
+        AS [L3 — GrandParent PK Column],
+
+     ISNULL(l4.L3_FK_Name, '— No FK —')
+        AS [L3 — GrandParent FK Constraint Name],
+
+    -- ============================================================
+    -- LEVEL 4 — GreatGrandParent
+    -- ============================================================
+     ISNULL(l4.L3_GreatGrandParentTable, '— No GreatGrandParent —')
+        AS [L4 — GreatGrandParent Table],
+
+     ISNULL(l4.L3_GreatGrandParentPK_Column, '—')
+        AS [L4 — GreatGrandParent PK Column],
+
+     ISNULL(l4.L4_FK_Name, '— No FK —')
+        AS [L4 — GreatGrandParent FK Constraint Name],
+
+    -- ============================================================
+    -- LEVEL 5 — GreatGreatGrandParent (Root)
+    -- ============================================================
+     ISNULL(l4.L4_GreatGreatGrandParentTable, '— Root Level —')
+        AS [L5 — GreatGreatGrandParent Table (Root)],
+
+     ISNULL(l4.L4_GreatGreatGrandParentPK_Column, '—')
+        AS [L5 — Root PK Column],
+
+    -- ============================================================
+    -- FULL PATH — Root to Child (for documentation)
+    -- ============================================================
+     CONCAT(
+         ISNULL(l4.L4_GreatGreatGrandParentTable + ' → ', '')
+        ,ISNULL(l4.L3_GreatGrandParentTable      + ' → ', '')
+        ,ISNULL(l4.L2_GrandParentTable            + ' → ', '')
+        ,l4.L1_ParentTable                        + ' → '
+        ,l4.L1_ChildTable
+     )                                                       AS [Full Hierarchy Path],
+
+    -- ============================================================
+    -- DEPTH LEVEL — How deep is this child table
+    -- ============================================================
+     CASE
+        WHEN l4.L4_GreatGreatGrandParentTable IS NOT NULL THEN 5
+        WHEN l4.L3_GreatGrandParentTable      IS NOT NULL THEN 4
+        WHEN l4.L2_GrandParentTable           IS NOT NULL THEN 3
+        WHEN l4.L1_ParentTable                IS NOT NULL THEN 2
+        ELSE 1
+     END                                                     AS [Depth Level],
+
+    -- ============================================================
+    -- DELETE ORDER — Who to delete first during purge
+    -- ============================================================
+     CASE
+        WHEN l4.L4_GreatGreatGrandParentTable IS NOT NULL 
+            THEN '1st — Delete this first (deepest level)'
+        WHEN l4.L3_GreatGrandParentTable      IS NOT NULL 
+            THEN '2nd — Delete after Level 5'
+        WHEN l4.L2_GrandParentTable           IS NOT NULL 
+            THEN '3rd — Delete after Level 4'
+        WHEN l4.L1_ParentTable                IS NOT NULL 
+            THEN '4th — Delete after Level 3'
+        ELSE         '5th — Delete last (Root table)'
+     END                                                     AS [Purge Delete Order],
+
+    -- ============================================================
+    -- ROW COUNTS at each level
+    -- ============================================================
+     (  SELECT SUM(p.rows)
+        FROM sys.partitions p
+        JOIN sys.tables     t ON p.object_id = t.object_id
+        WHERE CONCAT(SCHEMA_NAME(t.schema_id),'.', t.name) = l4.L1_ChildTable
+        AND   p.index_id   <= 1
+     )                                                       AS [Child Row Count],
+
+     (  SELECT SUM(p.rows)
+        FROM sys.partitions p
+        JOIN sys.tables     t ON p.object_id = t.object_id
+        WHERE CONCAT(SCHEMA_NAME(t.schema_id),'.', t.name) = l4.L1_ParentTable
+        AND   p.index_id   <= 1
+     )                                                       AS [Parent Row Count],
+
+     (  SELECT SUM(p.rows)
+        FROM sys.partitions p
+        JOIN sys.tables     t ON p.object_id = t.object_id
+        WHERE CONCAT(SCHEMA_NAME(t.schema_id),'.', t.name) = l4.L2_GrandParentTable
+        AND   p.index_id   <= 1
+     )                                                       AS [GrandParent Row Count],
+
+     (  SELECT SUM(p.rows)
+        FROM sys.partitions p
+        JOIN sys.tables     t ON p.object_id = t.object_id
+        WHERE CONCAT(SCHEMA_NAME(t.schema_id),'.', t.name) = l4.L3_GreatGrandParentTable
+        AND   p.index_id   <= 1
+     )                                                       AS [GreatGrandParent Row Count]
+
+FROM CTE_Level4                  l4
+ORDER BY 
+     [Depth Level]               DESC    -- deepest tables first
+    ,l4.L1_ChildTable
+    ,l4.L1_ParentTable
