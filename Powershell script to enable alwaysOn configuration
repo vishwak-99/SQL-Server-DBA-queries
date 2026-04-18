@@ -1,0 +1,17 @@
+# List of SQL instances
+$instances = @(
+ "ServerName\INSTANceName" 
+,"ServerName2\ "ServerName\INSTANceName2" 
+
+)
+ 
+foreach ($instance in $instances) {
+    try {
+        Write-Host "Enabling AlwaysOn for instance: $instance ..." -ForegroundColor Cyan
+        Enable-SqlAlwaysOn -ServerInstance $instance -Force
+        Write-Host "AlwaysOn enabled successfully on $instance" -ForegroundColor Green
+    }
+    catch {
+        Write-Host " Failed to enable AlwaysOn on $instance. Error: $($_.Exception.Message)" -ForegroundColor Red
+    }
+}
