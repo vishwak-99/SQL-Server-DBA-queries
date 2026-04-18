@@ -1,0 +1,187 @@
+--exec sampledb.dbo.[sp_PurgePersonCreditCardbkcp_Safe]
+
+--CREATE TABLE [sampledb].dbo.PurgeAuditLogPersonCreditCardbkcp
+--(
+--    AuditID          INT IDENTITY(1,1) PRIMARY KEY,  
+--    BatchID          UNIQUEIDENTIFIER   NOT NULL,    
+--    TableName        NVARCHAR(128)      NOT NULL,    
+--    BatchSize        INT                NOT NULL,    
+--    TotalRowsInRange INT                NOT NULL,    
+--    RowsDeleted      INT                NOT NULL,    
+--    RowsLeftToDelete INT                NOT NULL,    
+--    BatchStartTime   DATETIME           NOT NULL,    
+--    BatchEndTime     DATETIME           NOT NULL,    
+--    PurgeFromDate    DATETIME           NOT NULL,    
+--    PurgeToDate      DATETIME           NOT NULL,    
+--    [Status]         NVARCHAR(50)       NOT NULL,    
+--    ErrorMessage     NVARCHAR(4000)     NULL         
+--);
+
+
+CREATE OR ALTER PROCEDURE dbo.[sp_PurgePersonCreditCardbkcp_Safe]
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;  
+
+   /* Guard clause: refuse to run if a transaction is already open */
+    IF @@TRANCOUNT > 0
+    BEGIN
+        RAISERROR('Unexpected open transaction detected. Please rollback or commit before running purge.', 16, 1);
+        RETURN;
+    END
+
+    /* Declare variables*/
+    DECLARE @BatchID          UNIQUEIDENTIFIER = NEWID();
+    DECLARE @BatchNumber      INT              = 0;
+    DECLARE @RowsDeleted      INT              = 0;
+    DECLARE @TotalDeleted     INT              = 0;
+    DECLARE @RowsLeftToDelete INT              = 0;
+    DECLARE @TotalRowsInRange INT              = 0;
+    DECLARE @BatchStartTime   DATETIME;
+    DECLARE @BatchEndTime     DATETIME;
+    DECLARE @ErrorMessage     NVARCHAR(4000);
+    DECLARE @ErrorSeverity    INT;
+    DECLARE @ErrorState       INT;
+    DECLARE @StatusValue      NVARCHAR(50);
+
+    DECLARE @StartDate DATETIME = '2011-05-31';
+    DECLARE @EndDate   DATETIME = '2013-06-30';
+    DECLARE @ChunkSize INT      = 10;
+    DECLARE @TableName NVARCHAR(128) = 'Sales.PersonCreditCardbkcp';
+
+   /*
+    Step 0: Handle orphaned sessions before starting new purge
+   */    
+INSERT INTO sampledb.dbo.[PurgeAuditLogPersonCreditCardbkcp] (
+        BatchID, TableName, [BatchSize], TotalRowsInRange,
+        RowsDeleted, RowsLeftToDelete, BatchStartTime, BatchEndTime,
+        PurgeFromDate, PurgeToDate, [Status], ErrorMessage
+    )
+    SELECT
+        BatchID,
+        TableName,
+        [BatchSize],
+        TotalRowsInRange,
+        0,
+        RowsLeftToDelete,
+        GETDATE(),
+        GETDATE(),
+        PurgeFromDate,
+        PurgeToDate,
+        'KILLED',
+        'Session was hard-killed (KILL spid) before purge completed.'
+          + ' | Rows deleted: '     + CAST(TotalRowsInRange - RowsLeftToDelete AS NVARCHAR(20))
+          + ' out of '              + CAST(TotalRowsInRange                     AS NVARCHAR(20))
+          + ' | Remaining: '        + CAST(RowsLeftToDelete                     AS NVARCHAR(20))
+          + ' | Last batch ended: ' + CONVERT(NVARCHAR(30), BatchEndTime, 120)
+          + ' | Killed at: '        + CONVERT(NVARCHAR(30), GETDATE(), 120)
+    FROM (
+        SELECT TOP 1 *
+        FROM   sampledb.dbo.[PurgeAuditLogPersonCreditCardbkcp]
+        WHERE  [Status]     = 'RUNNING'
+        AND    BatchEndTime < DATEADD(MINUTE, -2, GETDATE())
+        ORDER BY BatchEndTime DESC
+    ) AS orphaned;
+
+    PRINT 'Checked for orphaned sessions. KILLED record inserted if found.';
+
+    /*
+    Step 1: Get initial count
+*/
+SELECT @RowsLeftToDelete = COUNT(1),
+           @TotalRowsInRange = COUNT(1)
+    FROM   [AdventureWorksSimulate].[Sales].[PersonCreditCardbkcp]
+    WHERE  [ModifiedDate] BETWEEN @StartDate AND @EndDate;
+
+    IF @RowsLeftToDelete = 0
+    BEGIN
+        PRINT 'No rows found in the given date range. Exiting.';
+        RETURN;
+    END
+
+/*
+-- Step 2: Purge loop with WHILE 1=1
+*/
+BEGIN TRY
+        WHILE 1 = 1
+        BEGIN
+            SET @BatchStartTime = GETDATE();
+            SET @BatchNumber    = @BatchNumber + 1;
+
+            BEGIN TRANSACTION;
+
+                DELETE TOP (@ChunkSize)
+                FROM   [AdventureWorksSimulate].[Sales].[PersonCreditCardbkcp]
+                WHERE  [ModifiedDate] BETWEEN @StartDate AND @EndDate;
+
+                SET @RowsDeleted = @@ROWCOUNT;
+
+            COMMIT TRANSACTION;
+
+            SET @TotalDeleted = @TotalDeleted + @RowsDeleted;
+            SET @BatchEndTime = GETDATE();
+
+            SELECT @RowsLeftToDelete = COUNT(1)
+            FROM   [AdventureWorksSimulate].[Sales].[PersonCreditCardbkcp]
+            WHERE  [ModifiedDate] BETWEEN @StartDate AND @EndDate;
+
+            INSERT INTO sampledb.dbo.[PurgeAuditLogPersonCreditCardbkcp] (
+                BatchID, TableName, [BatchSize], TotalRowsInRange,
+                RowsDeleted, RowsLeftToDelete, BatchStartTime, BatchEndTime,
+                PurgeFromDate, PurgeToDate, [Status], ErrorMessage
+            )
+            VALUES (
+                @BatchID, @TableName, @ChunkSize, @TotalRowsInRange,
+                @RowsDeleted, @RowsLeftToDelete, @BatchStartTime, @BatchEndTime,
+                @StartDate, @EndDate,
+                CASE WHEN @RowsLeftToDelete = 0 THEN 'SUCCESS' ELSE 'RUNNING' END,
+                NULL
+            );
+
+           /* --PRINT 'Batch ' + CAST(@BatchNumber AS NVARCHAR(10))
+            --    + ' deleted: ' + CAST(@RowsDeleted AS NVARCHAR(20))
+            --    + ' | Remaining: ' + CAST(@RowsLeftToDelete AS NVARCHAR(20)); */
+
+           /* -- Exit conditions */
+            IF @RowsDeleted = 0 OR @RowsLeftToDelete = 0
+            BEGIN
+                PRINT 'Purge complete. Total rows deleted: ' + CAST(@TotalDeleted AS NVARCHAR(20));
+                BREAK;
+            END
+        END
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0
+            ROLLBACK TRANSACTION;
+
+        SET @ErrorMessage  = ERROR_MESSAGE();
+        SET @ErrorSeverity = ERROR_SEVERITY();
+        SET @ErrorState    = ERROR_STATE();
+        SET @BatchEndTime  = GETDATE();
+
+        SET @StatusValue = 'FAILED';
+
+        INSERT INTO sampledb.dbo.[PurgeAuditLogPersonCreditCardbkcp] (
+            BatchID, TableName, [BatchSize], TotalRowsInRange,
+            RowsDeleted, RowsLeftToDelete, BatchStartTime, BatchEndTime,
+            PurgeFromDate, PurgeToDate, [Status], ErrorMessage
+        )
+        VALUES (
+            @BatchID, @TableName, @ChunkSize, @TotalRowsInRange,
+            0, @RowsLeftToDelete, @BatchStartTime, @BatchEndTime,
+            @StartDate, @EndDate,
+            @StatusValue,
+            @StatusValue + ' at batch ' + CAST(@BatchNumber AS NVARCHAR(10))
+              + ' | Reason: ' + ISNULL(@ErrorMessage, 'Unknown')
+              + ' | Severity: ' + CAST(ISNULL(@ErrorSeverity, 0) AS NVARCHAR(10))
+              + ' | State: ' + CAST(ISNULL(@ErrorState, 0) AS NVARCHAR(10))
+        );
+
+        PRINT 'Error caught: ' + ISNULL(@ErrorMessage, 'Unknown');
+
+        IF @ErrorSeverity > 0
+            RAISERROR(@ErrorMessage, @ErrorSeverity, @ErrorState);
+    END CATCH
+END
+GO
