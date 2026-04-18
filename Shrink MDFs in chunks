@@ -1,0 +1,38 @@
+DECLARE @from INT                             
+DECLARE @leap INT                             
+DECLARE @to INT                             
+DECLARE @datafile NVARCHAR(128)
+DECLARE @cmd NVARCHAR(512)
+DECLARE @dbname NVARCHAR(128)
+
+/*settings*/                                                      
+SET @dbname = N'DbName'
+SET @datafile = N'DatafileName'     /*Datafile name*/
+SET @leap = 500            /*Size of leaps in MB*/
+
+/* Get the current size of the data file */
+SELECT @from = size / 128 -- Convert pages to MB
+FROM sys.master_files
+WHERE name = @datafile AND database_id = DB_ID(@dbname)
+
+SET @to = 12345-10*1024       /*Goal size in MB*/ 
+-- Print start message
+PRINT '---  SHRINK SCRIPT START ---'
+
+WHILE ((@from - @leap) > @to)                             
+BEGIN
+    SET @from = @from - @leap
+    SET @cmd = N'USE ' + @dbname + '; DBCC SHRINKFILE (N''' + @datafile + N''', ' + CAST(@from AS NVARCHAR(20)) + N')'
+    PRINT @cmd 
+    -- EXEC(@cmd)
+    PRINT '--     SHRINKING  - ' + CAST((@from - @to) AS VARCHAR(20)) + 'MB LEFT'
+END
+
+SET @cmd = N'USE ' + @dbname + '; DBCC SHRINKFILE (N''' + @datafile + N''', ' + CAST(@to AS NVARCHAR(20)) + N')'
+PRINT @cmd 
+-- EXEC(@cmd)
+
+-- Print completion message
+PRINT '---  SHRINK SCRIPT COMPLETE ---'
+GO
+
