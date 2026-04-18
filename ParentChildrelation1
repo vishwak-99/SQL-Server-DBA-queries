@@ -49,15 +49,4 @@ GROUP BY fh.TableName
 	,fh.object_id
 ORDER BY [Hierarchy Level] DESC
 	,fh.TableName
-	/*
-
--- Generate ALTER TABLE NOCHECK statements for foreign keys
-SELECT 
-    'ALTER TABLE ' + QUOTENAME(OBJECT_SCHEMA_NAME(fk.parent_object_id)) 
-    + '.' + QUOTENAME(OBJECT_NAME(fk.parent_object_id)) 
-    + ' NOCHECK CONSTRAINT ' + QUOTENAME(fk.name) AS DisableFKScript
-FROM sys.foreign_keys fk
-WHERE fk.is_disabled = 1 OR fk.is_not_trusted = 1;
-
-
-*/
+	
