@@ -1,0 +1,75 @@
+USE master;
+GO
+
+SELECT TOP 1
+    CONVERT(VARCHAR(10), GETDATE(), 105) AS TodayDate,
+    SUBSTRING(LTRIM(RTRIM(@@servername)), 4, 3) AS Env,
+    CONCAT(
+        'ServerName: ', @@servername, ', ',
+        'Issue: ', 
+        CASE 
+            WHEN r.wait_type LIKE 'LCK%' THEN 
+                CASE 
+                    WHEN r.blocking_session_id IS NOT NULL THEN 'Blocking' 
+                    ELSE 'Lead Blocker' 
+                END
+            WHEN r.total_elapsed_time > 30000 THEN 'Long Running'
+            ELSE 'Multiple sessions'
+        END, ', ',
+        'Duration[hh:mm:ss.ms]: ', FORMAT(DATEADD(ms, r.total_elapsed_time, '00:00:00'), 'HH:mm:ss.fff'), '++ ', ', ',
+        'Start Time: ', CONVERT(VARCHAR(23), r.start_time, 121), ', ',
+        'SP Name: ', COALESCE(OBJECT_NAME(s.objectid, s.dbid), 'This is not a SP.')
+    ) AS [Concatenated Duration and Start Time and SP],
+    CONCAT(
+        'Session ID: ', CAST(r.session_id AS VARCHAR(10)), ', ',
+        'Database Name: ', DB_NAME(r.database_id), ', ',
+        'Command: ', r.command, ', ',
+        'Wait Type: ', ISNULL(r.wait_type, 'NULL'), ', ',
+        'Login Name: ', se.login_name, ', ',
+        'Host Name: ', se.host_name, ', ',
+        'Start Time: ', CONVERT(VARCHAR(23), r.start_time, 121), ', ',
+        'CPU Time (ms): ', CAST(r.cpu_time AS VARCHAR(20)), ', ',
+        'Total Elapsed Time (ms): ', CAST(r.total_elapsed_time AS VARCHAR(20)), ', ',
+        'Last Wait Type: ', r.last_wait_type, ', ',
+        'Status: ', sp.status, ', ',
+        
+        'Top Session Waits: ', 
+        STUFF((
+            SELECT ', ' + ws.wait_type + ' (' + 
+                CASE 
+                    WHEN SUM(ws.wait_time_ms) >= 3600000 THEN FORMAT(SUM(ws.wait_time_ms) / 3600000.0, 'N2') + ' hrs'
+                    WHEN SUM(ws.wait_time_ms) >= 60000 THEN FORMAT(SUM(ws.wait_time_ms) / 60000.0, 'N2') + ' mins'
+                    WHEN SUM(ws.wait_time_ms) >= 1000 THEN FORMAT(SUM(ws.wait_time_ms) / 1000.0, 'N2') + ' secs'
+                    ELSE CAST(SUM(ws.wait_time_ms) AS VARCHAR) + ' ms'
+                END + ')'
+            FROM sys.dm_exec_session_wait_stats ws
+            WHERE ws.session_id = r.session_id
+            GROUP BY ws.wait_type
+            ORDER BY SUM(ws.wait_time_ms) DESC
+            FOR XML PATH(''), TYPE
+        ).value('.', 'NVARCHAR(MAX)'), 1, 2, ''), ', ',
+		 'SP Name: ', COALESCE(OBJECT_NAME(s.objectid, s.dbid), 'This is not a SP'),' , ',
+		'SQL Text: ', REPLACE(REPLACE(s.text, CHAR(13), ''), CHAR(10), '')
+    ) AS [Concatenated Record],
+    CASE 
+        WHEN r.wait_type LIKE 'Pageio%' THEN 'updating the stats' 
+        ELSE 'no action taken' 
+    END AS actionTaken,
+    '' AS IncidentName,
+    'vishwak' AS ownerName
+FROM sys.dm_exec_requests r
+JOIN sys.dm_exec_sessions se ON r.session_id = se.session_id
+OUTER APPLY sys.dm_exec_sql_text(r.sql_handle) s
+OUTER APPLY sys.dm_exec_query_plan(r.plan_handle) p
+OUTER APPLY sys.dm_exec_cursors(r.session_id) AS SQL_CURSORS
+OUTER APPLY sys.dm_exec_sql_text(SQL_CURSORS.sql_handle) AS SQL_CURSORSQL
+LEFT JOIN sys.dm_exec_query_stats AS SQL_CURSORSTATS ON SQL_CURSORSTATS.sql_handle = SQL_CURSORS.sql_handle
+OUTER APPLY sys.dm_exec_query_plan(SQL_CURSORSTATS.plan_handle) AS SQL_CURSORPLAN
+JOIN sys.sysprocesses sp ON r.session_id = sp.spid
+WHERE login_name <> 'sa' -- Exclude sa login
+AND r.session_id <> @@SPID -- Exclude current session
+AND r.session_id > 50 -- Exclude system sessions
+--AND sp.status = N'sleeping' -- Include only sleeping sessions
+AND r.session_id = 465
+ORDER BY r.total_elapsed_time DESC; -- Order by elapsed time in descending order
+
