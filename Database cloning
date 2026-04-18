@@ -1,0 +1,4 @@
+DBCC CLONEDATABASE
+(
+originalDBname, cloneDBName
+)
