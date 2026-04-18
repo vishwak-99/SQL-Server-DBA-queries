@@ -1,0 +1,99 @@
+# Store Current Location to return to it when we're done
+Push-Location;
+ 
+ $ComputerName = $env:COMPUTERNAME;
+
+# Create an array to hold our results
+$results = @();
+ 
+# Let's get all the possible hives in the registry on a given system
+                                                                                  
+                                                                                    
+                                                                                      
+                                                        
+Get-ChildItem -Path 'HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server' | Where-Object {$_.Name -like '*MSSQL*'} | foreach {
+    
+    # Get Instance Name
+    $props = Get-ItemProperty -path $_.PSPath;
+ 
+    # If there is no default value, this isn't an instance. We need to trap in case the
+    # property doesn't exist
+    try {
+        $InstanceName = $props.psobject.Properties["(default)"].value;
+    }
+    catch {
+        $InstanceName = "";
+    }
+    
+    # If there is a valid instance name, proceed farther
+    if ($InstanceName.length -gt 0) {
+ 
+        # Navigate the child keys
+        foreach ($key in Get-ChildItem -path $_.pspath){
+    
+            # Find entries belonging to actual database engine instances
+if ($key.name -like "*MSSQLServer*")
+            {
+
+                # Navigate to the key where the TCP settings are stored
+                Set-Location -path $key.pspath;
+                cd .\SuperSocketNetLib\tcp -ErrorAction SilentlyContinue;
+ 
+                # Ensure we're only reporting against the right keys
+
+                $TCPKey = Get-Location;
+ 
+                if ($TCPKey -like '*SuperSocketNetLib*') {
+
+                    $TCPProps = Get-ItemProperty $TCPKey;
+ 
+                    # Find out if TCP is enabled
+                    $Enabled = $TCPProps.psobject.Properties["enabled"].value;
+            
+# If TCP is enabled, check for ports
+                    if ($Enabled -eq 1) {
+                        $dynamicPorts = "";
+                        $staticPorts = "";
+                        
+                        foreach ($Key in gci $TCPKey) {
+                         
+                            $IPprops = Get-ItemProperty $Key.pspath;
+                            
+                            # Get dynamic ports if they exist and are not empty or 0
+                            $dynPorts = $IPProps.psobject.Properties["TcpDynamicPorts"].Value;
+                            if ($dynPorts -and $dynPorts -ne "0") {
+                                $dynamicPorts = $dynPorts;
+                                                  
+                            }
+                            
+                            # Get static ports if they exist and are not empty or 0
+                            $staPorts = $IPProps.psobject.Properties["TcpPort"].Value;
+                            if ($staPorts -and $staPorts -ne "0") {
+                                $staticPorts = $staPorts;
+                            }
+                        }
+                        
+                        # Only add to results if we have at least one port value
+                        if ($dynamicPorts -or $staticPorts) {
+                            $result = New-Object PSObject -Property @{
+                                InstanceName = "$ComputerName\$InstanceName"
+                                DynamicPort = if ($dynamicPorts) { $dynamicPorts } else { "0" }
+                                StaticPort  = if ($staticPorts) { $staticPorts } else { "0" }
+                            }
+                            $results += $result;
+                        }
+                    }
+
+                                                                                                                                                                                                      
+                                  
+                }
+            }
+        }
+    }  
+}
+ 
+# Return to original location
+Pop-Location;
+ 
+# Output the results in tabular format
+$results | Select-Object InstanceName, DynamicPort, StaticPort | Format-Table -AutoSize
