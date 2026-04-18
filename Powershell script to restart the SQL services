@@ -1,0 +1,40 @@
+# List of SQL instances
+$instanceNames = @("InstanceName1", "InstanceName2")
+ 
+Write-Host "==== Step 1: Stopping SQL Agent services ====" -ForegroundColor Green
+foreach ($instance in $instanceNames) {
+    $svc = "SQLAgent`$$instance"
+    $service = Get-Service -Name $svc -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like "*SQL Server*" }
+    if ($service -and $service.Status -ne 'Stopped') {
+        Stop-Service -Name $svc -Force -Verbose
+        Write-Host "$svc stopped successfully." -ForegroundColor Green
+    } else {
+        Write-Host "$svc is already stopped or not found." -ForegroundColor Yellow
+    }
+}
+ 
+Write-Host "`n==== Step 2: Restarting SQL Server services ====" -ForegroundColor Green
+foreach ($instance in $instanceNames) {
+    $svc = "MSSQL`$$instance"
+    $service = Get-Service -Name $svc -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like "*SQL Server*" }
+    if ($service) {
+        Restart-Service -Name $svc -Force -Verbose
+        Write-Host "$svc restarted successfully." -ForegroundColor Green
+    } else {
+        Write-Host "$svc not found." -ForegroundColor Yellow
+    }
+}
+ 
+Write-Host "`n==== Step 3: Starting SQL Agent services again ====" -ForegroundColor Green
+foreach ($instance in $instanceNames) {
+    $svc = "SQLAgent`$$instance"
+    $service = Get-Service -Name $svc -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like "*SQL Server*" }
+    if ($service -and $service.Status -ne 'Running') {
+        Start-Service -Name $svc -Verbose
+        Write-Host "$svc started successfully." -ForegroundColor Green
+    } else {
+        Write-Host "$svc is already running or not found." -ForegroundColor Yellow
+    }
+}
+ 
+Write-Host "`n==== All actions completed ====" -ForegroundColor Green
