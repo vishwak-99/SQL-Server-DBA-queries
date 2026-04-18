@@ -1,0 +1,47 @@
+
+
+-- Drop the temporary table if it exists
+IF OBJECT_ID('tempdb..#tempdbDBdetails') IS NOT NULL
+    DROP TABLE #tempdbDBdetails;
+ 
+-- Create the temporary table
+CREATE TABLE #tempdbDBdetails
+(
+    [Database] NVARCHAR(128),
+    [State] NVARCHAR(128),
+    [Current Size (MB)] INT,
+    [Max Size (MB)] INT
+);
+ 
+-- Iterate through the specified databases
+DECLARE @DatabaseName NVARCHAR(128);
+ 
+DECLARE db_cursor CURSOR FOR
+SELECT name
+FROM sys.databases
+WHERE name IN (‘DbName’
+);
+ 
+OPEN db_cursor;
+FETCH NEXT FROM db_cursor INTO @DatabaseName;
+ 
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    -- Use the current database
+    EXEC('USE [' + @DatabaseName + '];
+ 
+    -- Insert data into the temporary table
+    INSERT INTO #tempdbDBdetails
+    SELECT DB_NAME() AS [Database], desired_state_desc AS [State], current_storage_size_mb AS [Current Size (MB)], max_storage_size_mb AS [Max Size (MB)]
+    FROM sys.database_query_store_options;');
+ 
+    FETCH NEXT FROM db_cursor INTO @DatabaseName;
+END
+ 
+-- Close and deallocate the cursor
+CLOSE db_cursor;
+DEALLOCATE db_cursor;
+ 
+-- Select the results from the temporary table
+SELECT * FROM #tempdbDBdetails order by [Database];
+go
