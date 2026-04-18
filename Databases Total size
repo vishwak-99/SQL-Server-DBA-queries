@@ -1,0 +1,16 @@
+SELECT
+    d.name AS DatabaseName,
+    d.create_date AS CreationDate,
+    ROUND(SUM(CAST(size AS float) * 8 / 1024), 2) AS TotalSizeMB,
+    ROUND(SUM(CAST(size AS float) * 8 / 1024 / 1024), 2) AS TotalSizeGB,
+    ROUND(SUM(CAST(size AS float) * 8 / 1024 / 1024 / 1024), 2) AS TotalSizeTB
+FROM 
+    sys.master_files AS f
+JOIN 
+    sys.databases AS d ON d.database_id = f.database_id
+WHERE 
+    d.name NOT IN ('tempdb', 'msdb', 'master', 'model')
+GROUP BY 
+    d.name, d.create_date
+ORDER BY 
+    TotalSizeMB DESC;
