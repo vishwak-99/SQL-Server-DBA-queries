@@ -1,0 +1,61 @@
+
+-- Create a temporary table to store the results
+IF OBJECT_ID('tempdb..#QueryStoreInfo') IS NOT NULL
+    DROP TABLE #QueryStoreInfo;
+
+CREATE TABLE #QueryStoreInfo (
+    DatabaseName NVARCHAR(128),
+    ActualState NVARCHAR(60),
+    CurrentStorageSizeMB NVARCHAR(20),
+    MaxStorageSizeMB NVARCHAR(20),
+    StorageUtilizationPercent FLOAT,
+    ReadOnlyReason NVARCHAR(256),
+    CleanupPolicy INT,
+    SizeBasedCleanupMode NVARCHAR(60)
+);
+
+-- Variable to store the dynamic SQL query
+DECLARE @Query NVARCHAR(MAX) = '';
+
+-- Construct the dynamic SQL to gather Query Store info from each database
+SELECT @Query = @Query + '
+USE ' + QUOTENAME(name) + ';
+IF EXISTS (SELECT 1 FROM sys.database_query_store_options WHERE actual_state_desc <> ''OFF'')
+BEGIN
+    INSERT INTO #QueryStoreInfo
+    SELECT
+        ''' + name + ''' AS DatabaseName,
+        actual_state_desc AS ActualState,
+        FORMAT(current_storage_size_mb, ''N0'') AS CurrentStorageSizeMB,
+        FORMAT(max_storage_size_mb, ''N0'') AS MaxStorageSizeMB,
+        CAST(current_storage_size_mb AS FLOAT) / CAST(max_storage_size_mb AS FLOAT) * 100 AS StorageUtilizationPercent,
+        CASE
+            WHEN readonly_reason = 1 THEN ''Database in read-only mode''
+            WHEN readonly_reason = 2 THEN ''Database in single-user mode''
+            WHEN readonly_reason = 4 THEN ''Database in emergency mode''
+            WHEN readonly_reason = 8 THEN ''Database is secondary replica''
+            WHEN readonly_reason = 65536 THEN ''Query Store has reached the size limit set by the MAX_STORAGE_SIZE_MB option''
+            WHEN readonly_reason = 131072 THEN ''The number of different statements in Query Store has reached the internal memory limit''
+            WHEN readonly_reason = 262144 THEN ''Size of in-memory items waiting to be persisted on disk has reached the internal memory limit''
+            WHEN readonly_reason = 524288 THEN ''User database has reached disk size limit''
+            ELSE ''N/A''
+        END AS ReadOnlyReason,
+        stale_query_threshold_days AS CleanupPolicy,
+        size_based_cleanup_mode_desc AS SizeBasedCleanupMode
+    FROM sys.database_query_store_options
+    WHERE actual_state_desc <> ''OFF'';
+END
+'
+FROM sys.databases
+WHERE state_desc = 'ONLINE';
+
+-- Execute the dynamic SQL
+EXEC sp_executesql @Query;
+
+-- Select the results from the temporary table
+SELECT *
+FROM #QueryStoreInfo;
+
+-- Drop the temporary table
+DROP TABLE #QueryStoreInfo;
+ 
