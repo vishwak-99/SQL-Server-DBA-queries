@@ -1,0 +1,13 @@
+
+/* Below query is useful for reverting the deleted rows */
+INSERT INTO adventureworks2022.Production.WorkOrderRouting
+(
+    WorkOrderID, ProductID, OperationSequence, LocationID,
+    ScheduledStartDate, ScheduledEndDate, ActualStartDate, ActualEndDate,
+    ActualResourceHrs, PlannedCost, ActualCost, ModifiedDate
+)
+SELECT WorkOrderID, ProductID, OperationSequence, LocationID,
+       ScheduledStartDate, ScheduledEndDate, ActualStartDate, ActualEndDate,
+       ActualResourceHrs, PlannedCost, ActualCost, ModifiedDate
+FROM purgedb.dbo.WorkOrderRoutingbackupTable
+WHERE WorkOrderID = 13 AND OperationSequence = 1;
