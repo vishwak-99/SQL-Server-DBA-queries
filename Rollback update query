@@ -1,0 +1,33 @@
+/* Below query is useful to revert the changes. basic syntax */
+UPDATE p
+SET p.PlannedCost       = b.PlannedCost,
+    p.ActualCost        = b.ActualCost,
+    p.ActualResourceHrs = b.ActualResourceHrs,
+    p.ScheduledStartDate= b.ScheduledStartDate,
+    p.ScheduledEndDate  = b.ScheduledEndDate,
+    p.ActualStartDate   = b.ActualStartDate,
+    p.ActualEndDate     = b.ActualEndDate,
+    p.ModifiedDate      = b.ModifiedDate
+FROM Production.WorkOrderRouting p
+JOIN purgedb.dbo.WorkOrderRouting b
+  ON p.WorkOrderID = b.WorkOrderID
+ AND p.OperationSequence = b.OperationSequence
+WHERE p.WorkOrderID = 13
+  AND p.OperationSequence = 1;
+
+/*
+
+-- need to check the before and after value before reverting it.
+  SELECT p.PlannedCost AS aftervalue,
+       b.PlannedCost AS beforevalue
+FROM Production.WorkOrderRouting p
+JOIN purgedb.dbo.WorkOrderRouting b
+  ON p.WorkOrderID = b.WorkOrderID
+ AND p.OperationSequence = b.OperationSequence
+WHERE p.WorkOrderID = 13
+  AND p.OperationSequence = 1;
+
+
+
+
+*/
