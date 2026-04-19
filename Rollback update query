@@ -1,6 +1,0 @@
-UPDATE msg
-SET msg.col= bckp.col
-FROM DBName.dbo.BackupTableName bckp 
-JOIN TableName1 msg
-ON bckp.col1 = msg.col2
-WHERE msg.col2 in (123)
