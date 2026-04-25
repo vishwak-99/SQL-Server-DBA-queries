@@ -1,0 +1,26 @@
+CREATE TABLE purgedb.dbo.PurgeAuditLogPersonCreditCard
+(
+    AuditID          INT IDENTITY(1,1),
+    BatchID          UNIQUEIDENTIFIER   NOT NULL,
+    TableName        NVARCHAR(128)      NOT NULL,
+    [BatchSize]      INT                NOT NULL,
+    TotalRowsInRange INT                NOT NULL,
+    RowsDeleted      INT                NOT NULL,
+    RowsLeftToDelete INT                NOT NULL,
+    BatchStartTime   DATETIME           NOT NULL,
+    BatchEndTime     DATETIME           NOT NULL,
+    PurgeFromDate    DATETIME           NOT NULL,
+    PurgeToDate      DATETIME           NOT NULL,
+    [Status]         NVARCHAR(50)       NOT NULL,
+    ErrorMessage     NVARCHAR(4000)     NULL,
+
+    CONSTRAINT PK_PurgeAuditLogPersonCreditCard 
+        PRIMARY KEY NONCLUSTERED (AuditID)
+);
+
+CREATE UNIQUE CLUSTERED INDEX IX_auditID_batchstarttime 
+ON purgedb.dbo.PurgeAuditLogPersonCreditCard(AuditID ASC, BatchStartTime);
+
+CREATE NONCLUSTERED INDEX NIX_tableName 
+ON purgedb.dbo.PurgeAuditLogPersonCreditCard(TableName);
+GO
