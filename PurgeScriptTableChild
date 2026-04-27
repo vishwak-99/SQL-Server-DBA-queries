@@ -1,0 +1,264 @@
+
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    IF @@TRANCOUNT > 0
+    BEGIN
+        RAISERROR('Unexpected open transaction. Rollback or commit first.', 16, 1);
+        RETURN;
+    END
+
+    DECLARE @StartDate    DATETIME      = '2011-05-31';
+    DECLARE @EndDate      DATETIME      = '2013-06-30';
+    DECLARE @ChunkSize    INT           = 500;
+    DECLARE @ParentTable  NVARCHAR(128) = 'Sales.Orders';
+    DECLARE @ChildTable1  NVARCHAR(128) = 'Sales.OrderItems';
+    DECLARE @ChildTable2  NVARCHAR(128) = 'Sales.OrderPayments';
+
+    DECLARE @BatchID                UNIQUEIDENTIFIER = NEWID();
+    DECLARE @BatchNumber            INT  = 0;
+    DECLARE @RowsDeletedChild1      INT  = 0;
+    DECLARE @RowsDeletedChild2      INT  = 0;
+    DECLARE @RowsDeletedParent      INT  = 0;
+    DECLARE @TotalDeletedParent     INT  = 0;
+
+    DECLARE @RowsLeftToDeleteChild1 INT  = 0;
+    DECLARE @RowsLeftToDeleteChild2 INT  = 0;
+    DECLARE @RowsLeftToDeleteParent INT  = 0;
+
+    DECLARE @TotalRowsInRangeChild1 INT  = 0;
+    DECLARE @TotalRowsInRangeChild2 INT  = 0;
+    DECLARE @TotalRowsInRangeParent INT  = 0;
+
+    DECLARE @BatchStartTime         DATETIME;
+    DECLARE @BatchEndTime           DATETIME;
+    DECLARE @ErrorMessage           NVARCHAR(4000);
+    DECLARE @ErrorSeverity          INT;
+    DECLARE @ErrorState             INT;
+
+
+    INSERT INTO purgedb.dbo.PurgeAuditLog (
+        BatchID, TableName, BatchSize, TotalRowsInRange,
+        RowsDeleted, RowsLeftToDelete,
+        BatchStartTime, BatchEndTime,
+        PurgeFromDate, PurgeToDate, [Status], ErrorMessage
+    )
+    SELECT
+        BatchID, TableName, BatchSize, TotalRowsInRange,
+        0, RowsLeftToDelete,
+        GETDATE(), GETDATE(),
+        PurgeFromDate, PurgeToDate, 'KILLED',
+        'Session hard-killed before completion.'
+        + ' | Rows deleted: ' + CAST(TotalRowsInRange - RowsLeftToDelete AS NVARCHAR(20))
+        + ' | Remaining: '    + CAST(RowsLeftToDelete AS NVARCHAR(20))
+        + ' | Last batch: '   + CONVERT(NVARCHAR(30), BatchEndTime, 120)
+        + ' | Killed at: '    + CONVERT(NVARCHAR(30), GETDATE(), 120)
+    FROM (
+        SELECT TOP 1 *
+        FROM purgedb.dbo.PurgeAuditLog
+        WHERE [Status]  = 'RUNNING'
+          AND TableName IN (@ParentTable, @ChildTable1, @ChildTable2)
+          AND BatchEndTime < DATEADD(MINUTE, -2, GETDATE())
+        ORDER BY BatchEndTime DESC
+    ) AS orphaned;
+
+    PRINT 'Orphaned session check done.';
+
+
+
+    -- Parent
+    SELECT @TotalRowsInRangeParent = COUNT(1),
+           @RowsLeftToDeleteParent = COUNT(1)
+    FROM [YourSourceDB].[Sales].[Orders]        -- Change
+    WHERE ModifiedDate BETWEEN @StartDate AND @EndDate;
+
+    -- Child 1
+    SELECT @TotalRowsInRangeChild1 = COUNT(1),
+           @RowsLeftToDeleteChild1 = COUNT(1)
+    FROM [YourSourceDB].[Sales].[OrderItems]    -- Change
+    WHERE ModifiedDate BETWEEN @StartDate AND @EndDate;
+
+    -- Child 2
+    SELECT @TotalRowsInRangeChild2 = COUNT(1),
+           @RowsLeftToDeleteChild2 = COUNT(1)
+    FROM [YourSourceDB].[Sales].[OrderPayments] -- Change
+    WHERE ModifiedDate BETWEEN @StartDate AND @EndDate;
+
+    IF @RowsLeftToDeleteParent = 0
+    BEGIN
+        PRINT 'No parent rows found in date range. Exiting.';
+        RETURN;
+    END
+
+
+    BEGIN TRY
+        WHILE 1 = 1
+        BEGIN
+            SET @BatchStartTime = GETDATE();
+            SET @BatchNumber    = @BatchNumber + 1;
+
+            BEGIN TRANSACTION;
+
+                -- Capture the batch of parent IDs to delete
+                CREATE TABLE #BatchParentIDs (OrderId INT); -- Change PK type/name
+
+                INSERT INTO #BatchParentIDs (OrderId)
+                SELECT TOP (@ChunkSize) OrderId
+                FROM [YourSourceDB].[Sales].[Orders]        -- Change
+                WHERE ModifiedDate BETWEEN @StartDate AND @EndDate;
+
+                -- Delete Child 1
+                DELETE c
+                FROM [YourSourceDB].[Sales].[OrderItems] c  -- Change
+                INNER JOIN #BatchParentIDs b ON c.OrderId = b.OrderId;
+
+                SET @RowsDeletedChild1 = @@ROWCOUNT;
+
+                -- Delete Child 2
+                DELETE c
+                FROM [YourSourceDB].[Sales].[OrderPayments] c -- Change
+                INNER JOIN #BatchParentIDs b ON c.OrderId = b.OrderId;
+
+                SET @RowsDeletedChild2 = @@ROWCOUNT;
+
+                -- Delete Parent
+                DELETE p
+                FROM [YourSourceDB].[Sales].[Orders] p      -- Change
+                INNER JOIN #BatchParentIDs b ON p.OrderId = b.OrderId;
+
+                SET @RowsDeletedParent = @@ROWCOUNT;
+
+                DROP TABLE #BatchParentIDs;
+
+            COMMIT TRANSACTION;
+
+            SET @TotalDeletedParent = @TotalDeletedParent + @RowsDeletedParent;
+            SET @BatchEndTime       = GETDATE();
+
+            -- Recount remaining rows for all tables
+            SELECT @RowsLeftToDeleteParent = COUNT(1)
+            FROM [YourSourceDB].[Sales].[Orders]
+            WHERE ModifiedDate BETWEEN @StartDate AND @EndDate;
+
+            SELECT @RowsLeftToDeleteChild1 = COUNT(1)
+            FROM [YourSourceDB].[Sales].[OrderItems]
+            WHERE ModifiedDate BETWEEN @StartDate AND @EndDate;
+
+            SELECT @RowsLeftToDeleteChild2 = COUNT(1)
+            FROM [YourSourceDB].[Sales].[OrderPayments]
+            WHERE ModifiedDate BETWEEN @StartDate AND @EndDate;
+
+/*            -- Audit log — one row per table, all going
+            -- into the SAME PurgeAuditLog table
+*/
+            -- Child 1 audit row
+            INSERT INTO purgedb.dbo.PurgeAuditLog (
+                BatchID, TableName, BatchSize, TotalRowsInRange,
+                RowsDeleted, RowsLeftToDelete,
+                BatchStartTime, BatchEndTime,
+                PurgeFromDate, PurgeToDate, [Status], ErrorMessage
+            )
+            VALUES (
+                @BatchID, @ChildTable1, @ChunkSize, @TotalRowsInRangeChild1,
+                @RowsDeletedChild1, @RowsLeftToDeleteChild1,
+                @BatchStartTime, @BatchEndTime,
+                @StartDate, @EndDate,
+                CASE WHEN @RowsLeftToDeleteChild1 = 0 THEN 'SUCCESS' ELSE 'RUNNING' END,
+                NULL
+            );
+
+            -- Child 2 audit row
+            INSERT INTO purgedb.dbo.PurgeAuditLog (
+                BatchID, TableName, BatchSize, TotalRowsInRange,
+                RowsDeleted, RowsLeftToDelete,
+                BatchStartTime, BatchEndTime,
+                PurgeFromDate, PurgeToDate, [Status], ErrorMessage
+            )
+            VALUES (
+                @BatchID, @ChildTable2, @ChunkSize, @TotalRowsInRangeChild2,
+                @RowsDeletedChild2, @RowsLeftToDeleteChild2,
+                @BatchStartTime, @BatchEndTime,
+                @StartDate, @EndDate,
+                CASE WHEN @RowsLeftToDeleteChild2 = 0 THEN 'SUCCESS' ELSE 'RUNNING' END,
+                NULL
+            );
+
+            -- Parent audit row
+            INSERT INTO purgedb.dbo.PurgeAuditLog (
+                BatchID, TableName, BatchSize, TotalRowsInRange,
+                RowsDeleted, RowsLeftToDelete,
+                BatchStartTime, BatchEndTime,
+                PurgeFromDate, PurgeToDate, [Status], ErrorMessage
+            )
+            VALUES (
+                @BatchID, @ParentTable, @ChunkSize, @TotalRowsInRangeParent,
+                @RowsDeletedParent, @RowsLeftToDeleteParent,
+                @BatchStartTime, @BatchEndTime,
+                @StartDate, @EndDate,
+                CASE WHEN @RowsLeftToDeleteParent = 0 THEN 'SUCCESS' ELSE 'RUNNING' END,
+                NULL
+            );
+
+            -- Exit condition
+            IF @RowsDeletedParent = 0 OR @RowsLeftToDeleteParent = 0
+            BEGIN
+                PRINT 'Purge complete. Total parent rows deleted: '
+                    + CAST(@TotalDeletedParent AS NVARCHAR(20));
+                BREAK;
+            END
+
+        END -- WHILE
+    END TRY
+
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0
+            ROLLBACK TRANSACTION;
+
+        IF OBJECT_ID('tempdb..#BatchParentIDs') IS NOT NULL
+            DROP TABLE #BatchParentIDs;
+
+        SET @ErrorMessage  = ERROR_MESSAGE();
+        SET @ErrorSeverity = ERROR_SEVERITY();
+        SET @ErrorState    = ERROR_STATE();
+        SET @BatchEndTime  = GETDATE();
+
+        INSERT INTO purgedb.dbo.PurgeAuditLog (
+            BatchID, TableName, BatchSize, TotalRowsInRange,
+            RowsDeleted, RowsLeftToDelete,
+            BatchStartTime, BatchEndTime,
+            PurgeFromDate, PurgeToDate, [Status], ErrorMessage
+        )
+        VALUES
+        (
+            @BatchID, @ChildTable1, @ChunkSize, @TotalRowsInRangeChild1,
+            0, @RowsLeftToDeleteChild1,
+            @BatchStartTime, @BatchEndTime,
+            @StartDate, @EndDate, 'FAILED',
+            'FAILED at batch ' + CAST(@BatchNumber AS NVARCHAR(10))
+            + ' | ' + ISNULL(@ErrorMessage, 'Unknown')
+        ),
+        (
+            @BatchID, @ChildTable2, @ChunkSize, @TotalRowsInRangeChild2,
+            0, @RowsLeftToDeleteChild2,
+            @BatchStartTime, @BatchEndTime,
+            @StartDate, @EndDate, 'FAILED',
+            'FAILED at batch ' + CAST(@BatchNumber AS NVARCHAR(10))
+            + ' | ' + ISNULL(@ErrorMessage, 'Unknown')
+        ),
+        (
+            @BatchID, @ParentTable, @ChunkSize, @TotalRowsInRangeParent,
+            0, @RowsLeftToDeleteParent,
+            @BatchStartTime, @BatchEndTime,
+            @StartDate, @EndDate, 'FAILED',
+            'FAILED at batch ' + CAST(@BatchNumber AS NVARCHAR(10))
+            + ' | Reason: '   + ISNULL(@ErrorMessage, 'Unknown')
+            + ' | Severity: ' + CAST(ISNULL(@ErrorSeverity, 0) AS NVARCHAR(10))
+            + ' | State: '    + CAST(ISNULL(@ErrorState,    0) AS NVARCHAR(10))
+        );
+
+        PRINT 'Error: ' + ISNULL(@ErrorMessage, 'Unknown');
+
+        IF @ErrorSeverity > 0
+            RAISERROR(@ErrorMessage, @ErrorSeverity, @ErrorState);
+    END CATCH
+GO
