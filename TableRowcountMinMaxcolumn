@@ -1,0 +1,42 @@
+SELECT 
+    DB_NAME() AS DatabaseName,
+    s.name AS SchemaName,
+    t.name AS TableName,
+    rc.TotalRows,
+    CASE 
+        WHEN dtc.system_type_id IN (40, 41, 42, 43, 58, 61) 
+        THEN 'SELECT MIN(' + QUOTENAME(idc.name) + ') AS MinId, ' +
+             'MAX(' + QUOTENAME(idc.name) + ') AS MaxId ' +
+             'FROM ' + QUOTENAME(DB_NAME()) + '.' + QUOTENAME(s.name) + '.' + QUOTENAME(t.name) +
+             ' WHERE ' + QUOTENAME(dtc.name) + ' <= ''2012-01-01'''
+
+        WHEN dtc.system_type_id = 56 
+        THEN 'SELECT MIN(' + QUOTENAME(idc.name) + ') AS MinId, ' +
+             'MAX(' + QUOTENAME(idc.name) + ') AS MaxId ' +
+             'FROM ' + QUOTENAME(DB_NAME()) + '.' + QUOTENAME(s.name) + '.' + QUOTENAME(t.name) +
+             ' WHERE ' + QUOTENAME(dtc.name) + ' <= 2012'
+    END AS PrintStatement
+FROM sys.tables t
+JOIN sys.schemas s 
+    ON t.schema_id = s.schema_id
+JOIN sys.columns idc 
+    ON t.object_id = idc.object_id 
+    AND idc.name IN ('ProductID', 'rowguid')
+JOIN sys.columns dtc 
+    ON t.object_id = dtc.object_id 
+    AND dtc.system_type_id IN (40, 41, 42, 43, 58, 61, 56)
+    AND dtc.name = 'ModifiedDate'   
+JOIN (
+    SELECT 
+        s_inner.name AS SchemaName,
+        t_inner.name AS TableName,
+        SUM(p.rows) AS TotalRows
+    FROM sys.tables t_inner
+    JOIN sys.schemas s_inner ON t_inner.schema_id = s_inner.schema_id
+    JOIN sys.partitions p
+        ON t_inner.object_id = p.object_id 
+        AND p.index_id IN (0, 1)
+    GROUP BY s_inner.name, t_inner.name
+) rc ON s.name = rc.SchemaName AND t.name = rc.TableName
+WHERE (dtc.system_type_id IN (40,41,42,43,58,61) OR dtc.system_type_id = 56)
+ORDER BY rc.TotalRows DESC, s.name, t.name, idc.name;
