@@ -1,0 +1,615 @@
+CREATE OR ALTER PROCEDURE dbo.usp_PurgingTest
+(
+    @TableName      NVARCHAR(400),
+    @AuditTableName NVARCHAR(400),
+    @RefColumn      NVARCHAR(128),
+    @WhereClause    NVARCHAR(MAX),
+    @ChunkSize      INT     = 10000,
+    @MaxDOP         INT     = 1,
+    @BatchDelay     CHAR(8) = '00:00:01'
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+    SET DEADLOCK_PRIORITY LOW;
+
+    DECLARE @CompatLevel INT = (
+        SELECT compatibility_level
+        FROM   sys.databases
+        WHERE  database_id = DB_ID()
+    );
+
+    IF @CompatLevel < 100
+    BEGIN
+        RAISERROR('Database compatibility level is %d. Must be 100 or higher.', 16, 1, @CompatLevel);
+        RETURN;
+    END
+
+    DECLARE @RecoveryModel NVARCHAR(60) = (
+        SELECT recovery_model_desc
+        FROM   sys.databases
+        WHERE  database_id = DB_ID()
+    );
+
+    PRINT 'Recovery model: ' + @RecoveryModel
+        + CASE
+            WHEN @RecoveryModel IN (N'SIMPLE', N'BULK_LOGGED')
+                THEN N' — CHECKPOINT will run every 5000 batches.'
+            ELSE N' — Issue LOG BACKUPs to manage log growth.'
+          END;
+
+
+    IF @TableName IS NULL OR @AuditTableName IS NULL OR @RefColumn IS NULL OR @WhereClause IS NULL
+    BEGIN
+        RAISERROR('@TableName, @AuditTableName, @RefColumn, and @WhereClause cannot be NULL.', 16, 1);
+        RETURN;
+    END
+
+    IF @ChunkSize <= 0 OR @ChunkSize > 50000
+    BEGIN
+        RAISERROR('@ChunkSize must be between 1 and 50000.', 16, 1);
+        RETURN;
+    END
+
+    DECLARE @Safe BIT = dbo.fn_Clause(@Clause);
+
+    IF @Safe = 0
+    BEGIN
+        RAISERROR('Unsafe WHERE clause detected. Execution aborted.', 16, 1);
+        RETURN;
+    END
+
+    DECLARE @AuditDBName     NVARCHAR(128) = PARSENAME(@AuditTableName, 3);
+    DECLARE @AuditSchemaName NVARCHAR(128) = ISNULL(PARSENAME(@AuditTableName, 2), N'dbo');
+    DECLARE @AuditBaseTable  NVARCHAR(128) = PARSENAME(@AuditTableName, 1);
+
+    IF @AuditBaseTable IS NULL
+    BEGIN
+        SET @AuditSchemaName = N'dbo';
+        SET @AuditBaseTable  = @AuditTableName;
+    END
+
+    DECLARE @FullAuditName NVARCHAR(500) =
+        CASE
+            WHEN @AuditDBName IS NOT NULL
+                THEN QUOTENAME(@AuditDBName) + N'.' + QUOTENAME(@AuditSchemaName) + N'.' + QUOTENAME(@AuditBaseTable)
+            ELSE
+                QUOTENAME(@AuditSchemaName) + N'.' + QUOTENAME(@AuditBaseTable)
+        END;
+
+    BEGIN TRY
+        DECLARE @TableExists INT;
+        DECLARE @CheckSQL NVARCHAR(MAX) =
+            N'SELECT @exists = CASE WHEN OBJECT_ID(@fullname, ''U'') IS NOT NULL THEN 1 ELSE 0 END';
+
+        EXEC sp_executesql
+            @CheckSQL,
+            N'@fullname NVARCHAR(500), @exists INT OUTPUT',
+            @fullname = @FullAuditName,
+            @exists   = @TableExists OUTPUT;
+
+        IF @TableExists = 0
+        BEGIN
+            DECLARE @CreateSQL NVARCHAR(MAX) =
+                N'CREATE TABLE ' + @FullAuditName + N'
+                (
+                    AuditID           INT IDENTITY(1,1)  NOT NULL,
+                    BatchID           UNIQUEIDENTIFIER   NOT NULL,
+                    TableName         NVARCHAR(400)      NOT NULL,
+                    BatchSize         INT                NOT NULL,
+                    TotalRowsInRange  INT                NOT NULL,
+                    RowsDeleted       INT                NOT NULL,
+                    RowsLeftToDelete  INT                NOT NULL,
+                    BatchStartTime    DATETIME2          NOT NULL,
+                    BatchEndTime      DATETIME2          NOT NULL,
+                    RangeDeletion     NVARCHAR(500)      NOT NULL,
+                    [Status]          NVARCHAR(50)       NOT NULL,
+                    ErrorMessage      NVARCHAR(4000)     NULL,
+                    ChunkRangeDetails NVARCHAR(MAX)      NULL,
+                    CONSTRAINT PK_PurgeAuditLog PRIMARY KEY CLUSTERED (AuditID)
+                );
+                CREATE NONCLUSTERED INDEX IX_PurgeAuditLog_TableName_BatchEndTime
+                    ON ' + @FullAuditName + N' (TableName, BatchEndTime DESC)
+                    INCLUDE (Status, RowsLeftToDelete, TotalRowsInRange, BatchID);';
+
+            EXEC sp_executesql @CreateSQL;
+            PRINT 'Audit table created: ' + @FullAuditName;
+        END
+        ELSE
+       begin
+			/* Add ChunkRangeDetails column if it was missing from an older version */
+			declare @AddColSQL nvarchar(MAX) = N'
+                IF NOT EXISTS
+                (
+                    SELECT 1
+                    FROM   ' + case when @AuditDBName is not null then QUOTENAME(@AuditDBName) + N'.sys.columns' else N'sys.columns' end + N'
+                    WHERE  object_id = OBJECT_ID(''' + @FullAuditName + N''')
+                    AND    name      = ''ChunkRangeDetails''
+                )
+                ALTER TABLE ' + @FullAuditName + N'
+                    ADD ChunkRangeDetails NVARCHAR(MAX) NULL;';
+
+			exec sp_executesql @AddColSQL;
+		end
+    END TRY
+    BEGIN CATCH
+        DECLARE @AuditErrMsg NVARCHAR(4000) = ERROR_MESSAGE();
+        RAISERROR('Failed to ensure audit table exists: %s', 16, 1, @AuditErrMsg);
+        RETURN;
+    END CATCH
+
+    DECLARE @SourceDBName  NVARCHAR(128) = PARSENAME(@TableName, 3);
+    DECLARE @SchemaName    NVARCHAR(128) = ISNULL(PARSENAME(@TableName, 2), N'dbo');
+    DECLARE @BaseTableName NVARCHAR(128) = PARSENAME(@TableName, 1);
+
+    IF @BaseTableName IS NULL
+    BEGIN
+        SET @SchemaName    = N'dbo';
+        SET @BaseTableName = @TableName;
+    END
+
+    DECLARE @FullTableName NVARCHAR(256) =
+        CASE
+            WHEN @SourceDBName IS NOT NULL
+                THEN QUOTENAME(@SourceDBName) + N'.' + QUOTENAME(@SchemaName) + N'.' + QUOTENAME(@BaseTableName)
+            ELSE
+                QUOTENAME(@SchemaName) + N'.' + QUOTENAME(@BaseTableName)
+        END;
+
+
+    DECLARE @BatchID          UNIQUEIDENTIFIER;  
+    DECLARE @BatchNumber      INT              = 0;
+    DECLARE @RowsDeleted      INT              = 0;
+    DECLARE @TotalDeleted     INT              = 0;
+    DECLARE @RowsLeftToDelete INT              = 0;
+    DECLARE @TotalRowsInRange INT              = 0;
+    DECLARE @BatchStartTime   DATETIME2;
+    DECLARE @BatchEndTime     DATETIME2;
+    DECLARE @RangeMessage     NVARCHAR(500);
+    DECLARE @MinRefValue      NVARCHAR(50);
+    DECLARE @MaxRefValue      NVARCHAR(50);
+    DECLARE @SQL              NVARCHAR(MAX);
+    DECLARE @CurrentRunningAuditID INT;   
+
+
+    DECLARE @AuditInsertTemplate NVARCHAR(MAX) =
+        N'INSERT INTO ' + @FullAuditName + N'
+            (BatchID, TableName, BatchSize, TotalRowsInRange, RowsDeleted,
+             RowsLeftToDelete, BatchStartTime, BatchEndTime,
+             RangeDeletion, [Status], ErrorMessage, ChunkRangeDetails)
+          VALUES
+            (@BatchIDParam, @TableNameParam, @ChunkSizeParam, @TotalRowsInRangeParam,
+             @RowsDeletedParam, @RowsLeftToDeleteParam, @BatchStartTimeParam, @BatchEndTimeParam,
+             @RangeMessageParam, @StatusParam, @ErrMsgParam, @ChunkRangeDetailsParam);
+          SELECT @NewAuditIDParam = SCOPE_IDENTITY();';
+
+    DECLARE @AuditInsertParamDef NVARCHAR(MAX) =
+        N'@BatchIDParam           UNIQUEIDENTIFIER,
+          @TableNameParam         NVARCHAR(400),
+          @ChunkSizeParam         INT,
+          @TotalRowsInRangeParam  INT,
+          @RowsDeletedParam       INT,
+          @RowsLeftToDeleteParam  INT,
+          @BatchStartTimeParam    DATETIME2,
+          @BatchEndTimeParam      DATETIME2,
+          @RangeMessageParam      NVARCHAR(500),
+          @StatusParam            NVARCHAR(50),
+          @ErrMsgParam            NVARCHAR(4000),
+          @ChunkRangeDetailsParam NVARCHAR(MAX),
+          @NewAuditIDParam        INT OUTPUT';
+
+    /* -- Reusable UPDATE template: updates a specific AuditID row by PK */
+    DECLARE @AuditUpdateTemplate NVARCHAR(MAX) =
+        N'UPDATE ' + @FullAuditName + N'
+          SET    [Status]          = @StatusParam,
+                 BatchEndTime      = @BatchEndTimeParam,
+                 RowsDeleted       = @RowsDeletedParam,
+                 RowsLeftToDelete  = @RowsLeftToDeleteParam,
+                 ErrorMessage      = @ErrMsgParam
+          WHERE  AuditID           = @AuditIDParam;';
+
+    DECLARE @AuditUpdateParamDef NVARCHAR(MAX) =
+        N'@AuditIDParam        INT,
+          @StatusParam         NVARCHAR(50),
+          @BatchEndTimeParam   DATETIME2,
+          @RowsDeletedParam    INT,
+          @RowsLeftToDeleteParam INT,
+          @ErrMsgParam         NVARCHAR(4000)';
+
+    BEGIN TRY
+     
+        DECLARE @OrphanBatchID   UNIQUEIDENTIFIER;
+        DECLARE @OrphanAuditID   INT;
+
+        SET @SQL =
+            N'SELECT TOP 1
+                  @OrphanBatchIDOut = BatchID,
+                  @OrphanAuditIDOut = AuditID
+              FROM   ' + @FullAuditName + N'
+              WHERE  TableName = @TableNameParam
+              AND    [Status]  = ''RUNNING''
+              ORDER  BY AuditID DESC;';
+
+        EXEC sp_executesql
+            @SQL,
+            N'@TableNameParam    NVARCHAR(400),
+              @OrphanBatchIDOut  UNIQUEIDENTIFIER OUTPUT,
+              @OrphanAuditIDOut  INT OUTPUT',
+            @TableNameParam    = @TableName,
+            @OrphanBatchIDOut  = @OrphanBatchID OUTPUT,
+            @OrphanAuditIDOut  = @OrphanAuditID OUTPUT;
+
+        IF @OrphanAuditID IS NOT NULL
+        BEGIN
+            SET @BatchEndTime = GETDATE();
+
+            EXEC sp_executesql
+                @AuditUpdateTemplate, @AuditUpdateParamDef,
+                @AuditIDParam          = @OrphanAuditID,
+                @StatusParam           = N'KILLED',
+                @BatchEndTimeParam     = @BatchEndTime,
+                @RowsDeletedParam      = 0,
+                @RowsLeftToDeleteParam = 0,
+                @ErrMsgParam           = N'Batch was interrupted by a KILL command, job stop, or server restart.DELETE was rolled back. RowsDeleted = 0 for this batch. Next run resumed under the same BatchID. '
+                                   
+
+          /*  -- Resume under the same BatchID so the session audit trail is continuous. */
+            SET @BatchID = @OrphanBatchID;
+
+            PRINT 'Orphaned RUNNING row (AuditID=' + CAST(@OrphanAuditID AS NVARCHAR(20))
+                + ') marked KILLED. Resuming under BatchID: ' + CAST(@BatchID AS NVARCHAR(50));
+        END
+        ELSE
+            BEGIN
+            SET @BatchID = NEWID();
+            PRINT 'No orphaned session found. Starting fresh. BatchID: ' + CAST(@BatchID AS NVARCHAR(50));
+        END
+    END TRY
+    BEGIN CATCH
+        DECLARE @OrphanErrMsg      NVARCHAR(4000) = ERROR_MESSAGE();
+        DECLARE @OrphanErrSeverity INT            = ERROR_SEVERITY();
+        DECLARE @OrphanErrState    INT            = ERROR_STATE();
+
+        RAISERROR('Orphan handler failed: %s', @OrphanErrSeverity, @OrphanErrState, @OrphanErrMsg);
+        RETURN;
+    END CATCH
+
+    BEGIN TRY
+        DECLARE @LiveRunning INT = 0;
+
+        SET @SQL =
+            N'SELECT @LiveRunningOut = COUNT(1)
+              FROM   ' + @FullAuditName + N'
+              WHERE  TableName = @TableNameParam
+              AND    [Status]  = ''RUNNING'';';
+
+        EXEC sp_executesql
+            @SQL,
+            N'@TableNameParam  NVARCHAR(400),
+              @LiveRunningOut  INT OUTPUT',
+            @TableNameParam  = @TableName,
+            @LiveRunningOut  = @LiveRunning OUTPUT;
+
+        IF @LiveRunning > 0
+        BEGIN
+            RAISERROR(
+                'Table ''%s'' is currently being purged by another active session.A RUNNING batch row exists in the audit log. Wait for it to complete or investigate before retrying. '
+               ,
+                16, 1, @TableName
+            );
+            RETURN;
+        END
+    END TRY
+    BEGIN CATCH
+        DECLARE @GuardErrMsg      NVARCHAR(4000) = ERROR_MESSAGE();
+        DECLARE @GuardErrSeverity INT            = ERROR_SEVERITY();
+        DECLARE @GuardErrState    INT            = ERROR_STATE();
+
+        RAISERROR('Concurrent run guard failed: %s', @GuardErrSeverity, @GuardErrState, @GuardErrMsg);
+        RETURN;
+    END CATCH
+
+    DECLARE @DeleteTemplate NVARCHAR(MAX) =
+        N'DELETE TOP (@ChunkSizeParam)
+          FROM  ' + @FullTableName + N'
+          WHERE ' + @WhereClause + N'
+          OPTION (MAXDOP ' + CAST(@MaxDOP AS NVARCHAR(2)) + N');';
+
+
+    SET @SQL =
+        N'SELECT
+              @MinRef = COALESCE(CAST(MIN(' + QUOTENAME(@RefColumn) + N') AS VARCHAR(50)), ''NoRecordsFoundForThisRange''),
+              @MaxRef = COALESCE(CAST(MAX(' + QUOTENAME(@RefColumn) + N') AS VARCHAR(50)), ''NoRecordsFoundForThisRange'')
+          FROM ' + @FullTableName + N'
+          WHERE ' + @WhereClause;
+
+    EXEC sp_executesql
+        @SQL,
+        N'@MinRef NVARCHAR(50) OUTPUT, @MaxRef NVARCHAR(50) OUTPUT',
+        @MinRef = @MinRefValue OUTPUT,
+        @MaxRef = @MaxRefValue OUTPUT;
+
+    SET @RangeMessage = N'Date range for deletion: ' + @MinRefValue + N' to ' + @MaxRefValue;
+
+    BEGIN TRY
+        SET @SQL =
+            N'SELECT @RowsLeftToDelete = COUNT(1),
+                     @TotalRowsInRange = COUNT(1)
+              FROM   ' + @FullTableName + N'
+              WHERE  ' + @WhereClause;
+
+        EXEC sp_executesql
+            @SQL,
+            N'@RowsLeftToDelete INT OUTPUT, @TotalRowsInRange INT OUTPUT',
+            @RowsLeftToDelete = @RowsLeftToDelete OUTPUT,
+            @TotalRowsInRange = @TotalRowsInRange OUTPUT;
+
+        SET @BatchStartTime = GETDATE();
+        SET @BatchEndTime   = GETDATE();
+
+        IF @RowsLeftToDelete = 0
+        BEGIN
+            PRINT 'No rows match the WHERE clause. Exiting.';
+
+            DECLARE @NoRowsMsg    NVARCHAR(4000) =
+                N'No records found for deletion. Table: ' + @TableName
+                + N' | Range: ' + @RangeMessage;
+            DECLARE @DummyAuditID INT;
+
+            EXEC sp_executesql
+                @AuditInsertTemplate, @AuditInsertParamDef,
+                @BatchIDParam           = @BatchID,
+                @TableNameParam         = @TableName,
+                @ChunkSizeParam         = @ChunkSize,
+                @TotalRowsInRangeParam  = 0,
+                @RowsDeletedParam       = 0,
+                @RowsLeftToDeleteParam  = 0,
+                @BatchStartTimeParam    = @BatchStartTime,
+                @BatchEndTimeParam      = @BatchEndTime,
+                @RangeMessageParam      = @RangeMessage,
+                @StatusParam            = N'NO_RECORDS_FOUND',
+                @ErrMsgParam            = @NoRowsMsg,
+                @ChunkRangeDetailsParam = NULL,
+                @NewAuditIDParam        = @DummyAuditID OUTPUT;
+
+            RETURN;
+        END
+    END TRY
+    BEGIN CATCH
+        DECLARE @InitErrMsg      NVARCHAR(4000) = ERROR_MESSAGE();
+        DECLARE @InitErrSeverity INT            = ERROR_SEVERITY();
+        DECLARE @InitErrState    INT            = ERROR_STATE();
+        DECLARE @InitDummyID     INT;
+
+        EXEC sp_executesql
+            @AuditInsertTemplate, @AuditInsertParamDef,
+            @BatchIDParam           = @BatchID,
+            @TableNameParam         = @TableName,
+            @ChunkSizeParam         = @ChunkSize,
+            @TotalRowsInRangeParam  = @TotalRowsInRange,
+            @RowsDeletedParam       = 0,
+            @RowsLeftToDeleteParam  = @RowsLeftToDelete,
+            @BatchStartTimeParam    = @BatchStartTime,
+            @BatchEndTimeParam      = @BatchEndTime,
+            @RangeMessageParam      = @RangeMessage,
+            @StatusParam            = N'FAILED',
+            @ErrMsgParam            = @InitErrMsg,
+            @ChunkRangeDetailsParam = NULL,
+            @NewAuditIDParam        = @InitDummyID OUTPUT;
+
+        RAISERROR(@InitErrMsg, @InitErrSeverity, @InitErrState);
+    END CATCH
+
+    BEGIN TRY
+        DECLARE @ExistingStarted INT = 0;
+        DECLARE @SentinelDummyID INT;
+
+        SET @SQL =
+            N'SELECT @ExistingStartedOut = COUNT(1)
+              FROM   ' + @FullAuditName + N'
+              WHERE  BatchID  = @BatchIDParam
+              AND    [Status] = ''STARTED'';';
+
+        EXEC sp_executesql
+            @SQL,
+            N'@BatchIDParam         UNIQUEIDENTIFIER,
+              @ExistingStartedOut   INT OUTPUT',
+            @BatchIDParam         = @BatchID,
+            @ExistingStartedOut   = @ExistingStarted OUTPUT;
+
+        IF @ExistingStarted = 0
+        BEGIN
+            EXEC sp_executesql
+                @AuditInsertTemplate, @AuditInsertParamDef,
+                @BatchIDParam           = @BatchID,
+                @TableNameParam         = @TableName,
+                @ChunkSizeParam         = @ChunkSize,
+                @TotalRowsInRangeParam  = @TotalRowsInRange,
+                @RowsDeletedParam       = 0,
+                @RowsLeftToDeleteParam  = @RowsLeftToDelete,
+                @BatchStartTimeParam    = @BatchStartTime,
+                @BatchEndTimeParam      = @BatchEndTime,
+                @RangeMessageParam      = @RangeMessage,
+                @StatusParam            = N'STARTED',
+                @ErrMsgParam            = NULL,
+                @ChunkRangeDetailsParam = NULL,
+                @NewAuditIDParam        = @SentinelDummyID OUTPUT;
+
+            PRINT 'STARTED sentinel written. BatchID: ' + CAST(@BatchID AS NVARCHAR(50));
+        END
+        ELSE
+        BEGIN
+            PRINT 'Resuming killed session. Existing STARTED sentinel retained. BatchID: '
+                + CAST(@BatchID AS NVARCHAR(50));
+        END
+    END TRY
+    BEGIN CATCH
+        DECLARE @SentinelErrMsg      NVARCHAR(4000) = ERROR_MESSAGE();
+        DECLARE @SentinelErrSeverity INT            = ERROR_SEVERITY();
+        DECLARE @SentinelErrState    INT            = ERROR_STATE();
+
+        RAISERROR('Failed to write STARTED sentinel: %s', @SentinelErrSeverity, @SentinelErrState, @SentinelErrMsg);
+        RETURN;
+    END CATCH
+
+
+    BEGIN TRY
+        WHILE 1 = 1
+        BEGIN
+            SET @BatchNumber    = @BatchNumber + 1;
+            SET @BatchStartTime = GETDATE();
+
+            SET @CurrentRunningAuditID = NULL;
+
+            EXEC sp_executesql
+                @AuditInsertTemplate, @AuditInsertParamDef,
+                @BatchIDParam           = @BatchID,
+                @TableNameParam         = @TableName,
+                @ChunkSizeParam         = @ChunkSize,
+                @TotalRowsInRangeParam  = @TotalRowsInRange,
+                @RowsDeletedParam       = 0,
+                @RowsLeftToDeleteParam  = @RowsLeftToDelete,
+                @BatchStartTimeParam    = @BatchStartTime,
+                @BatchEndTimeParam      = @BatchStartTime,   -- no end time yet
+                @RangeMessageParam      = @RangeMessage,
+                @StatusParam            = N'RUNNING',
+                @ErrMsgParam            = NULL,
+                @ChunkRangeDetailsParam = NULL,
+                @NewAuditIDParam        = @CurrentRunningAuditID OUTPUT;
+
+          
+            BEGIN TRANSACTION;
+
+            EXEC sp_executesql
+                @DeleteTemplate,
+                N'@ChunkSizeParam INT, @MaxDOPParam INT',
+                @ChunkSizeParam = @ChunkSize,
+                @MaxDOPParam    = @MaxDOP;
+
+            SET @RowsDeleted = @@ROWCOUNT;
+
+            COMMIT TRANSACTION;
+
+            SET @TotalDeleted = @TotalDeleted + @RowsDeleted;
+            SET @BatchEndTime = GETDATE();
+
+            WAITFOR DELAY @BatchDelay;
+
+            SET @SQL =
+                N'SELECT @RowsLeftToDelete = COUNT(1)
+                  FROM   ' + @FullTableName + N'
+                  WHERE  ' + @WhereClause;
+
+            EXEC sp_executesql
+                @SQL,
+                N'@RowsLeftToDelete INT OUTPUT',
+                @RowsLeftToDelete = @RowsLeftToDelete OUTPUT;
+
+          
+           declare @ChunkRangeDetailsJSON nvarchar(MAX);
+
+			if @CompatLevel >= 130
+			begin
+				/* SQL Server 2016+*/
+				set @SQL = N'SELECT @Json = (
+                        SELECT
+                            @TableNameParam   AS TableName,
+                            @MinRefParam      AS MinRefValue,
+                            @MaxRefParam      AS MaxRefValue,
+                            @WhereClauseParam AS Predicate,
+                            @BatchNumberParam AS BatchNumber,
+                            @ChunkSizeParam   AS ChunkSize,
+                            @MaxDOPParam      AS MaxDOP,
+                            @BatchDelayParam  AS BatchDelay
+                        FOR JSON PATH, WITHOUT_ARRAY_WRAPPER
+                    );';
+
+				exec sp_executesql @SQL, N'@TableNameParam   NVARCHAR(128),
+                      @MinRefParam      NVARCHAR(50),
+                      @MaxRefParam      NVARCHAR(50),
+                      @WhereClauseParam NVARCHAR(MAX),
+                      @BatchNumberParam INT,
+                      @ChunkSizeParam   INT,
+                      @MaxDOPParam      INT,
+                      @BatchDelayParam  CHAR(8),
+                      @Json             NVARCHAR(MAX) OUTPUT', @TableNameParam = @TableName, @MinRefParam = @MinRefValue, @MaxRefParam = @MaxRefValue, @WhereClauseParam = @WhereClause, @BatchNumberParam = @BatchNumber, @ChunkSizeParam = @ChunkSize, @MaxDOPParam = @MaxDOP, @BatchDelayParam = @BatchDelay, @Json = @ChunkRangeDetailsJSON output;
+			end
+			else
+			begin
+				/* SQL Server 2014 — manual JSON build */
+				set @ChunkRangeDetailsJSON = N'{"TableName":"' + REPLACE(@TableName, '"', '\"') + N'",' + N'"MinRefValue":"' + REPLACE(@MinRefValue, '"', '\"') + N'",' + N'"MaxRefValue":"' + REPLACE(@MaxRefValue, '"', '\"') + N'",' + N'"Predicate":"' + REPLACE(@WhereClause, '"', '\"') + N'",' + N'"BatchNumber":' + CAST(@BatchNumber as nvarchar(20)) + N',' + N'"ChunkSize":' + CAST(@ChunkSize as nvarchar(20)) + N',' + N'"MaxDOP":' + CAST(@MaxDOP as nvarchar(10)) + N',' + N'"BatchDelay":"' + @BatchDelay + N'"}';
+			end
+           
+            IF @RowsLeftToDelete = 0
+            BEGIN
+             /*   -- Last batch — update RUNNING → SUCCESS */
+                EXEC sp_executesql
+                    @AuditUpdateTemplate, @AuditUpdateParamDef,
+                    @AuditIDParam          = @CurrentRunningAuditID,
+                    @StatusParam           = N'SUCCESS',
+                    @BatchEndTimeParam     = @BatchEndTime,
+                    @RowsDeletedParam      = @RowsDeleted,
+                    @RowsLeftToDeleteParam = 0,
+                    @ErrMsgParam           = NULL;
+
+                PRINT 'Purge complete. Total deleted: ' + CAST(@TotalDeleted AS NVARCHAR(20))
+                    + ' in ' + CAST(@BatchNumber AS NVARCHAR(20)) + ' batches.';
+
+                BREAK;
+            END
+            ELSE
+            BEGIN
+           /*     -- Normal batch — update RUNNING → COMPLETED */
+                EXEC sp_executesql
+                    @AuditUpdateTemplate, @AuditUpdateParamDef,
+                    @AuditIDParam          = @CurrentRunningAuditID,
+                    @StatusParam           = N'COMPLETED',
+                    @BatchEndTimeParam     = @BatchEndTime,
+                    @RowsDeletedParam      = @RowsDeleted,
+                    @RowsLeftToDeleteParam = @RowsLeftToDelete,
+                    @ErrMsgParam           = NULL;
+            END
+
+            IF @BatchNumber % 5000 = 0
+               AND @RecoveryModel IN (N'SIMPLE', N'BULK_LOGGED')
+            BEGIN
+                CHECKPOINT;
+                PRINT 'Checkpoint at batch ' + CAST(@BatchNumber AS NVARCHAR(20))
+                    + '. Total deleted: ' + CAST(@TotalDeleted AS NVARCHAR(20));
+                WAITFOR DELAY '00:00:01';
+            END
+
+            IF @BatchNumber % 100 = 0
+                PRINT 'Batch ' + CAST(@BatchNumber      AS NVARCHAR(20))
+                    + ' | Deleted: '   + CAST(@TotalDeleted     AS NVARCHAR(20))
+                    + ' | Remaining: ' + CAST(@RowsLeftToDelete AS NVARCHAR(20));
+
+        END 
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0
+            ROLLBACK;
+
+        DECLARE @PurgeErrMsg      NVARCHAR(4000) = ERROR_MESSAGE();
+        DECLARE @PurgeErrSeverity INT            = ERROR_SEVERITY();
+        DECLARE @PurgeErrState    INT            = ERROR_STATE();
+
+        SET @BatchEndTime = GETDATE();
+
+        IF @CurrentRunningAuditID IS NOT NULL
+        BEGIN
+            EXEC sp_executesql
+                @AuditUpdateTemplate, @AuditUpdateParamDef,
+                @AuditIDParam          = @CurrentRunningAuditID,
+                @StatusParam           = N'FAILED',
+                @BatchEndTimeParam     = @BatchEndTime,
+                @RowsDeletedParam      = 0,
+                @RowsLeftToDeleteParam = @RowsLeftToDelete,
+                @ErrMsgParam           = @PurgeErrMsg;
+        END
+
+        RAISERROR(@PurgeErrMsg, @PurgeErrSeverity, @PurgeErrState);
+    END CATCH
+END
+GO
