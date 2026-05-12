@@ -1,0 +1,199 @@
+WITH LifecycleRows AS (
+    -- One row per BatchID per status type, pulling the latest of each
+    SELECT
+        TableName,
+        BatchID,
+        SessionID,
+        [Status],
+        BatchStartTime,
+        BatchEndTime,
+        RowsDeleted,
+        RowsLeftToDelete,
+        TotalRowsInRange,
+        BatchSize,
+        ErrorMessage,
+        ChunkRangeDetails,
+        RangeDeletion,
+        ROW_NUMBER() OVER (
+            PARTITION BY BatchID, [Status]
+            ORDER BY AuditID DESC
+        ) AS rn
+    FROM dbo.PurgeAuditLog
+),
+
+PerBatch AS (
+    SELECT
+        TableName,
+        BatchID,
+        SessionID,
+
+        -- Lifecycle timestamps
+        MAX(CASE WHEN [Status] = 'STARTED'          THEN BatchStartTime END) AS StartedAt,
+        MAX(CASE WHEN [Status] = 'STARTED'          THEN TotalRowsInRange END) AS InitialRows,
+        MAX(CASE WHEN [Status] = 'RUNNING'          THEN BatchStartTime END) AS LastRunningStart,
+        MAX(CASE WHEN [Status] = 'COMPLETED'        THEN BatchEndTime  END) AS LastCompletedAt,
+        MAX(CASE WHEN [Status] = 'SUCCESS'          THEN BatchEndTime  END) AS SucceededAt,
+        MAX(CASE WHEN [Status] = 'FAILED'           THEN BatchEndTime  END) AS FailedAt,
+        MAX(CASE WHEN [Status] = 'KILLED'           THEN BatchEndTime  END) AS KilledAt,
+
+        -- Progress from the most recent meaningful row
+        MAX(CASE WHEN [Status] IN ('RUNNING','COMPLETED','SUCCESS','FAILED')
+                 THEN RowsLeftToDelete END)                                  AS RowsLeft,
+        MAX(CASE WHEN [Status] IN ('SUCCESS','FAILED','COMPLETED','RUNNING')
+                 THEN RowsDeleted END)                                       AS LastBatchRowsDeleted,
+        MAX(BatchSize)                                                       AS ChunkSize,
+
+        -- Cumulative deleted: best source is SUCCESS ChunkRangeDetails JSON
+        -- fallback: InitialRows - RowsLeft
+        MAX(CASE WHEN [Status] = 'SUCCESS' THEN RowsDeleted END)            AS FinalBatchRowsDeleted,
+
+        -- Error capture
+        MAX(CASE WHEN [Status] IN ('FAILED','KILLED')
+                 THEN ErrorMessage END)                                      AS ErrorMessage,
+
+        -- Terminal status flag
+        MAX(CASE WHEN [Status] = 'SUCCESS'          THEN 1 ELSE 0 END)      AS IsSuccess,
+        MAX(CASE WHEN [Status] = 'FAILED'           THEN 1 ELSE 0 END)      AS IsFailed,
+        MAX(CASE WHEN [Status] = 'KILLED'           THEN 1 ELSE 0 END)      AS IsKilled,
+        MAX(CASE WHEN [Status] = 'RUNNING'          THEN 1 ELSE 0 END)      AS HasRunning,
+        MAX(CASE WHEN [Status] = 'NO_RECORDS_FOUND' THEN 1 ELSE 0 END)      AS IsNoRecords,
+
+        -- Range info from STARTED row
+        MAX(CASE WHEN [Status] = 'STARTED'          THEN RangeDeletion END) AS RangeDeletion,
+
+        -- Latest ChunkRangeDetails JSON (progress snapshot from COMPLETED or SUCCESS)
+        MAX(CASE WHEN [Status] IN ('COMPLETED','SUCCESS')
+                 THEN ChunkRangeDetails END)                                 AS LatestChunkDetails,
+
+        -- Batch count approximation from JSON BatchNumber field
+        -- (since COMPLETED rows are trimmed, use ChunkRangeDetails on surviving row)
+        MAX(CASE WHEN [Status] = 'SUCCESS'
+                 THEN CAST(JSON_VALUE(ChunkRangeDetails, '$.BatchNumber') AS INT) END) AS TotalBatches,
+        MAX(CASE WHEN [Status] = 'COMPLETED'
+                 THEN CAST(JSON_VALUE(ChunkRangeDetails, '$.BatchNumber') AS INT) END) AS LastKnownBatch
+
+    FROM LifecycleRows
+    WHERE rn = 1
+    GROUP BY TableName, BatchID, SessionID
+),
+
+Final AS (
+    SELECT
+        TableName,
+        BatchID,
+        SessionID,
+        RangeDeletion,
+        ChunkSize,
+        InitialRows,
+
+        -- Total deleted: prefer InitialRows - RowsLeft for accuracy
+        ISNULL(InitialRows, 0) - ISNULL(RowsLeft, 0)                        AS TotalDeleted,
+        RowsLeft                                                             AS RemainingRows,
+
+        -- Progress %
+        CAST(ROUND(
+            (ISNULL(InitialRows, 0) - ISNULL(RowsLeft, 0)) * 100.0
+            / NULLIF(InitialRows, 0)
+        , 2) AS DECIMAL(5,2))                                                AS ProgressPct,
+
+        -- Batch counts
+        COALESCE(TotalBatches, LastKnownBatch)                               AS BatchesRun,
+
+        -- Duration
+        StartedAt,
+        COALESCE(SucceededAt, FailedAt, KilledAt, SYSDATETIME())            AS EffectiveEndTime,
+        DATEDIFF(SECOND, StartedAt,
+            COALESCE(SucceededAt, FailedAt, KilledAt, SYSDATETIME()))       AS ElapsedSec,
+
+        -- Rows/sec throughput
+        CASE
+            WHEN DATEDIFF(SECOND, StartedAt,
+                     COALESCE(SucceededAt, FailedAt, KilledAt, SYSDATETIME())) > 0
+            THEN CAST(
+                    (ISNULL(InitialRows,0) - ISNULL(RowsLeft,0)) * 1.0
+                    / DATEDIFF(SECOND, StartedAt,
+                          COALESCE(SucceededAt, FailedAt, KilledAt, SYSDATETIME()))
+                 AS DECIMAL(10,1))
+            ELSE NULL
+        END                                                                  AS RowsPerSec,
+
+        -- ETA seconds remaining (for in-progress runs)
+        CASE
+            WHEN HasRunning = 1
+             AND DATEDIFF(SECOND, StartedAt, SYSDATETIME()) > 0
+             AND (ISNULL(InitialRows,0) - ISNULL(RowsLeft,0)) > 0
+            THEN CAST(
+                    ISNULL(RowsLeft, 0) * 1.0
+                    / (
+                        (ISNULL(InitialRows,0) - ISNULL(RowsLeft,0)) * 1.0
+                        / DATEDIFF(SECOND, StartedAt, SYSDATETIME())
+                      )
+                 AS DECIMAL(10,0))
+            ELSE NULL
+        END                                                                  AS ETARemainingSec,
+
+        -- Human status
+        CASE
+            WHEN IsNoRecords = 1  THEN 'NO DATA'
+            WHEN IsSuccess   = 1  THEN 'SUCCESS ✓'
+            WHEN IsFailed    = 1  THEN 'FAILED ✗'
+            WHEN IsKilled    = 1  THEN 'KILLED ✗'
+            WHEN HasRunning  = 1  THEN 'IN PROGRESS ⟳'
+            ELSE                       'UNKNOWN'
+        END                                                                  AS RunStatus,
+
+        ErrorMessage,
+        LatestChunkDetails
+
+    FROM PerBatch
+)
+
+SELECT
+    TableName                                           AS [Table],
+    CAST(BatchID AS NVARCHAR(50))                       AS [BatchID],
+    SessionID                                           AS [SID],
+    RunStatus                                           AS [Status],
+    FORMAT(StartedAt,       'yyyy-MM-dd HH:mm:ss')      AS [Started At],
+    FORMAT(EffectiveEndTime,'yyyy-MM-dd HH:mm:ss')      AS [Last Activity],
+
+    -- Duration
+    CASE
+        WHEN ElapsedSec >= 3600
+        THEN CAST(ElapsedSec / 3600 AS NVARCHAR) + 'h '
+           + CAST((ElapsedSec % 3600) / 60 AS NVARCHAR) + 'm'
+        WHEN ElapsedSec >= 60
+        THEN CAST(ElapsedSec / 60 AS NVARCHAR) + 'm '
+           + CAST(ElapsedSec % 60 AS NVARCHAR) + 's'
+        ELSE CAST(ElapsedSec AS NVARCHAR) + 's'
+    END                                                 AS [Duration],
+
+    FORMAT(InitialRows,  '#,##0')                       AS [Initial Rows],
+    FORMAT(ISNULL(InitialRows,0) - ISNULL(RemainingRows,0), '#,##0')
+                                                        AS [Deleted],
+    FORMAT(RemainingRows,'#,##0')                       AS [Remaining],
+    CAST(ProgressPct AS NVARCHAR) + '%'                 AS [Progress],
+    FORMAT(ChunkSize,    '#,##0')                       AS [Chunk Size],
+    FORMAT(BatchesRun,   '#,##0')                       AS [Batches],
+    FORMAT(RowsPerSec,   '#,##0.0') + ' rows/s'        AS [Throughput],
+
+    -- ETA display
+    CASE
+        WHEN ETARemainingSec IS NULL THEN NULL
+        WHEN ETARemainingSec >= 3600
+        THEN CAST(ETARemainingSec / 3600 AS NVARCHAR) + 'h '
+           + CAST((ETARemainingSec % 3600) / 60 AS NVARCHAR) + 'm remaining'
+        WHEN ETARemainingSec >= 60
+        THEN CAST(ETARemainingSec / 60 AS NVARCHAR) + 'm '
+           + CAST(ETARemainingSec % 60 AS NVARCHAR) + 's remaining'
+        ELSE CAST(ETARemainingSec AS NVARCHAR) + 's remaining'
+    END                                                 AS [ETA],
+
+    RangeDeletion                                       AS [Key Range],
+    ErrorMessage                                        AS [Error],
+    LatestChunkDetails                                  AS [Last Chunk JSON]
+
+FROM Final
+ORDER BY
+    -- Active runs first, then most recent
+    CASE RunStatus WHEN 'IN PROGRESS ⟳' THEN 0 ELSE 1 END,
+    StartedAt DESC;
