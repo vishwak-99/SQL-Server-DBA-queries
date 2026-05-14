@@ -1,0 +1,86 @@
+;with LatestBatch
+as (
+	select TableName, MAX(AuditID) as MaxAuditID
+	from [AdventureWorks2022Purge].[dbo].[PurgeAuditLog]
+	group by TableName
+	), LatestBatchID
+as (
+	select al.TableName, al.BatchID, al.DBName
+	from [AdventureWorks2022Purge].[dbo].[PurgeAuditLog] al
+	inner join LatestBatch lb on lb.TableName = al.TableName and lb.MaxAuditID = al.AuditID
+	), StartedSentinel
+as (
+	select al.TableName, al.BatchID, al.TotalRowsInRange, al.BatchStartTime as JobStartTime, al.BatchSize as ChunkSize, ROW_NUMBER() over (
+			partition by al.TableName, al.BatchID order by al.AuditID asc
+			) as rn
+	from [AdventureWorks2022Purge].[dbo].[PurgeAuditLog] al
+	where al.[Status] = N'STARTED'
+	), SuccessRow
+as (
+	select al.TableName, al.BatchID, al.RowsLeftToDelete, al.BatchEndTime as LastBatchEndTime
+	from [AdventureWorks2022Purge].[dbo].[PurgeAuditLog] al
+	where al.[Status] = N'SUCCESS'
+	), FailedRow
+as (
+	select al.TableName, al.BatchID, al.ErrorMessage, al.RowsLeftToDelete, al.BatchEndTime as LastBatchEndTime, ROW_NUMBER() over (
+			partition by al.TableName, al.BatchID order by al.AuditID desc
+			) as rn
+	from [AdventureWorks2022Purge].[dbo].[PurgeAuditLog] al
+	where al.[Status] = N'FAILED'
+	), KilledRow
+as (
+	select al.TableName, al.BatchID, al.AuditID as KilledAuditID, al.BatchEndTime as LastBatchEndTime, ROW_NUMBER() over (
+			partition by al.TableName, al.BatchID order by al.AuditID desc
+			) as rn
+	from [AdventureWorks2022Purge].[dbo].[PurgeAuditLog] al
+	where al.[Status] = N'KILLED'
+	), PostKillActivity
+as (
+	select distinct al.TableName, al.BatchID
+	from [AdventureWorks2022Purge].[dbo].[PurgeAuditLog] al
+	inner join KilledRow kr on kr.TableName = al.TableName and kr.BatchID = al.BatchID and kr.rn = 1 and al.AuditID > kr.KilledAuditID -- strictly AFTER the kill
+	where al.[Status] in (N'RUNNING', N'COMPLETED')
+	), RunningRow
+as (
+	select al.TableName, al.BatchID, al.SessionID, al.RowsLeftToDelete, al.BatchStartTime, al.BatchSize as ChunkSize, DATEDIFF(SECOND, al.BatchStartTime, SYSDATETIME()) as CurrentBatchRunSec, ROW_NUMBER() over (
+			partition by al.TableName, al.BatchID order by al.AuditID desc
+			) as rn
+	from [AdventureWorks2022Purge].[dbo].[PurgeAuditLog] al
+	where al.[Status] = N'RUNNING'
+	), CompletedStats
+as (
+	select al.TableName, al.BatchID, COUNT(*) as CompletedBatchCount, AVG(DATEDIFF(MILLISECOND, al.BatchStartTime, al.BatchEndTime)) as AvgBatchMs, MAX(al.BatchEndTime) as LastCompletedTime, MAX(al.RowsLeftToDelete) as LatestRowsLeft
+	from [AdventureWorks2022Purge].[dbo].[PurgeAuditLog] al
+	where al.[Status] = N'COMPLETED'
+	group by al.TableName, al.BatchID
+	), PrevBatch
+as (
+	select al.TableName, al.BatchID, DATEDIFF(MILLISECOND, al.BatchStartTime, al.BatchEndTime) as PrevBatchMs, ROW_NUMBER() over (
+			partition by al.TableName, al.BatchID order by al.AuditID desc 
+			) as rn
+	from [AdventureWorks2022Purge].[dbo].[PurgeAuditLog] al
+	where al.[Status] = N'COMPLETED'
+	), LiveSessions
+as (
+	select session_id
+	from sys.dm_exec_requests
+	where status = 'running'
+	)
+select lb.DBName, lb.TableName, ISNULL(ss.TotalRowsInRange, 0) as TotalRowsInRange, case when sr.BatchID is not null then ISNULL(ss.TotalRowsInRange, 0) -- all done
+		else ISNULL(ss.TotalRowsInRange, 0) - ISNULL(COALESCE(rr.RowsLeftToDelete, c.LatestRowsLeft, 0), 0) end as RowsDeleted, case when sr.BatchID is not null then 0 else ISNULL(COALESCE(rr.RowsLeftToDelete, c.LatestRowsLeft), 0) end as RowsLeftToDelete, CAST(case when sr.BatchID is not null then 100.00 when ISNULL(ss.TotalRowsInRange, 0) = 0 then 0 else ROUND(100.0 * (ISNULL(ss.TotalRowsInRange, 0) - ISNULL(COALESCE(rr.RowsLeftToDelete, c.LatestRowsLeft, 0), 0)) / ISNULL(ss.TotalRowsInRange, 1), 2) end as decimal(6, 2)) as PctComplete, case when sr.BatchID is not null then 0 when ISNULL(COALESCE(ss.ChunkSize, rr.ChunkSize), 0) = 0 then null else CEILING(ISNULL(COALESCE(rr.RowsLeftToDelete, c.LatestRowsLeft), 0) * 1.0 / COALESCE(ss.ChunkSize, rr.ChunkSize)) end as EstimatedBatchesLeft, case when sr.BatchID is not null then N'Purge completed successfully' when fr.BatchID is not null then N'Purge failed — see ErrorMessage' when ISNULL(c.AvgBatchMs, 0) = 0 then N'Insufficient history — check back after first batch completes' when ISNULL(COALESCE(ss.ChunkSize, rr.ChunkSize)
+				, 0) = 0 then N'ChunkSize is zero — cannot estimate' else CONVERT(nvarchar(20), DATEADD(MILLISECOND, CAST(CEILING(ISNULL(COALESCE(rr.RowsLeftToDelete, c.LatestRowsLeft), 0) * 1.0 / COALESCE(ss.ChunkSize, rr.ChunkSize)) * c.AvgBatchMs as bigint), CAST('00:00:00' as time)), 108 
+			) end as EstimatedTimeLeft, case 
+	
+		when fr.BatchID is not null and fr.rn = 1 then N'FAILED: Purge ended with an error — ' + ISNULL(fr.ErrorMessage, N'(no error message captured)') + N' | RowsLeftToDelete: ' + CAST(ISNULL(fr.RowsLeftToDelete, 0) as nvarchar(20)) + N'. Fix the issue and re-run the purge procedure to resume.' when kr.BatchID is not null and kr.rn = 1 and sr.BatchID is null and fr.BatchID is null and pka.BatchID is null then N'KILLED: The purge session was terminated before completion. ' + N'Re-run the purge procedure — it will detect the orphaned batch and resume automatically.' when rr.BatchID is not null and rr.rn = 1 and ls.session_id is not null and pb.PrevBatchMs is not null and rr.CurrentBatchRunSec * 1000.0 > pb.PrevBatchMs then N'WARNING: current batch has been running ' + CAST(rr.CurrentBatchRunSec as nvarchar(10)) + 's which exceeds the previous batch duration of ' + CAST(CAST(pb.PrevBatchMs / 1000.0 as decimal(10, 2)) as nvarchar(20)) + 's. Investigate blocking, lock waits, or server load.' else null end as StuckMessage, ss.JobStartTime, COALESCE(sr.LastBatchEndTime, fr.
+		LastBatchEndTime, kr.LastBatchEndTime, c.LastCompletedTime) as LastBatchEndTime, ISNULL(c.CompletedBatchCount, 0) as CompletedBatchCount, case when fr.BatchID is not null then fr.ErrorMessage else null end as ErrorMessage
+from LatestBatchID lb
+left join StartedSentinel ss on ss.TableName = lb.TableName and ss.BatchID = lb.BatchID and ss.rn = 1
+left join SuccessRow sr on sr.TableName = lb.TableName and sr.BatchID = lb.BatchID
+left join FailedRow fr on fr.TableName = lb.TableName and fr.BatchID = lb.BatchID and fr.rn = 1
+left join KilledRow kr on kr.TableName = lb.TableName and kr.BatchID = lb.BatchID and kr.rn = 1
+left join PostKillActivity pka on pka.TableName = lb.TableName and pka.BatchID = lb.BatchID
+left join RunningRow rr on rr.TableName = lb.TableName and rr.BatchID = lb.BatchID and rr.rn = 1
+left join CompletedStats c on c.TableName = lb.TableName and c.BatchID = lb.BatchID
+left join PrevBatch pb on pb.TableName = lb.TableName and pb.BatchID = lb.BatchID and pb.rn = 1
+left join LiveSessions ls on ls.session_id = rr.SessionID
+order by lb.DBName, lb.TableName;
