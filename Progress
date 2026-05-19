@@ -1,0 +1,280 @@
+
+CREATE OR ALTER VIEW [dbo].[vw_PurgeProgress]
+AS
+WITH
+
+/* ── 0. Latest STARTED row per table ───────────────────────────
+       Anchors every other CTE to the current run only.          */
+LatestRun AS (
+    SELECT
+        TableName,
+        MAX(AuditID)        AS StartAuditID,
+        MIN(BatchStartTime) AS RunStartTime
+    FROM [YourAuditDB].[dbo].[PurgeAuditLog]
+    WHERE [Status] = N'STARTED'
+    GROUP BY TableName
+),
+
+/* ── 1. Latest RUNNING row per table (current run only) ─────── */
+RunningBatch AS (
+    SELECT
+        a.TableName,
+        MAX(a.AuditID)  AS LatestRunningAuditID
+    FROM [YourAuditDB].[dbo].[PurgeAuditLog] a
+    JOIN LatestRun lr ON lr.TableName = a.TableName
+    WHERE a.[Status] = N'RUNNING'
+      AND a.AuditID  > lr.StartAuditID
+    GROUP BY a.TableName
+),
+
+/* ── 2. Avg/max completed-batch duration for this run ───────── */
+BatchTiming AS (
+    SELECT
+        a.TableName,
+        COUNT(*)                                                AS CompletedBatches,
+        AVG(DATEDIFF(MILLISECOND, a.BatchStartTime,
+                                  a.BatchEndTime))             AS AvgBatchMs,
+        MAX(DATEDIFF(MILLISECOND, a.BatchStartTime,
+                                  a.BatchEndTime))             AS MaxBatchMs
+    FROM [YourAuditDB].[dbo].[PurgeAuditLog] a
+    JOIN LatestRun lr ON lr.TableName = a.TableName
+    WHERE a.[Status] IN (N'COMPLETED', N'SUCCESS')
+      AND a.AuditID  > lr.StartAuditID
+    GROUP BY a.TableName
+),
+
+/* ── 3. Aggregate totals — current run only ─────────────────── */
+Totals AS (
+    SELECT
+        a.TableName,
+        MAX(a.InstanceName)                                     AS InstanceName,
+        MAX(a.DBName)                                           AS DBName,
+        MAX(a.SessionID)                                        AS SessionID,
+        lr.RunStartTime                                         AS PurgeStartTime,
+        MAX(CASE WHEN a.[Status] = N'STARTED'
+                 THEN a.TotalRowsInRange ELSE 0 END)            AS TotalRowsInRange,
+        SUM(CASE WHEN a.[Status] IN (N'COMPLETED', N'SUCCESS')
+                 THEN a.RowsDeleted ELSE 0 END)                 AS TotalDeletedSoFar,
+        MAX(a.BatchSize)                                        AS ChunkSize,
+        MAX(a.[Status])                                         AS LatestStatus
+    FROM [YourAuditDB].[dbo].[PurgeAuditLog] a
+    JOIN LatestRun lr ON lr.TableName = a.TableName
+    WHERE a.AuditID >= lr.StartAuditID
+    GROUP BY a.TableName, lr.RunStartTime
+)
+
+SELECT
+    /* ── Identity ───────────────────────────────────────────── */
+    t.InstanceName,
+    t.DBName,
+    t.TableName,
+    t.SessionID,
+
+    /* ── Status ─────────────────────────────────────────────── */
+    CASE
+        WHEN rb.LatestRunningAuditID IS NOT NULL THEN N'RUNNING'
+        WHEN t.LatestStatus = N'SUCCESS'         THEN N'COMPLETE'
+        WHEN t.LatestStatus = N'FAILED'          THEN N'FAILED'
+        WHEN t.LatestStatus = N'KILLED'          THEN N'KILLED'
+        ELSE t.LatestStatus
+    END                                                         AS [Status],
+
+    /* ── Row counters ───────────────────────────────────────── */
+    t.TotalRowsInRange,
+    t.TotalDeletedSoFar,
+    CASE
+        WHEN t.TotalRowsInRange > t.TotalDeletedSoFar
+        THEN t.TotalRowsInRange - t.TotalDeletedSoFar
+        ELSE 0
+    END                                                         AS RowsRemaining,
+
+    /* ── % complete ─────────────────────────────────────────── */
+    CASE
+        WHEN t.TotalRowsInRange > 0
+        THEN CAST(ROUND(
+                100.0 * t.TotalDeletedSoFar / t.TotalRowsInRange
+             , 1) AS DECIMAL(5,1))
+        ELSE 100.0
+    END                                                         AS PctComplete,
+
+    /* ── Batch stats ─────────────────────────────────────────── */
+    bt.CompletedBatches,
+    t.ChunkSize,
+    bt.AvgBatchMs                                               AS AvgBatchDurationMs,
+
+    /* ── Timing ─────────────────────────────────────────────── */
+    t.PurgeStartTime,
+    SYSDATETIME()                                               AS [Now],
+
+    /* Elapsed  hh:mm:ss.mmm */
+    RIGHT('0' + CAST(DATEDIFF(MILLISECOND, t.PurgeStartTime, SYSDATETIME()) / 3600000        AS VARCHAR(4)), 4)
+    + ':' + RIGHT('0' + CAST(DATEDIFF(MILLISECOND, t.PurgeStartTime, SYSDATETIME()) /   60000 % 60 AS VARCHAR(2)), 2)
+    + ':' + RIGHT('0' + CAST(DATEDIFF(MILLISECOND, t.PurgeStartTime, SYSDATETIME()) /    1000 % 60 AS VARCHAR(2)), 2)
+    + '.' + RIGHT('00'  + CAST(DATEDIFF(MILLISECOND, t.PurgeStartTime, SYSDATETIME())       % 1000 AS VARCHAR(3)), 3)
+                                                                AS ElapsedHMS,
+
+    DATEDIFF(MILLISECOND, t.PurgeStartTime, SYSDATETIME())     AS ElapsedMs,
+
+    /* ── ETA: absolute finish datetime ──────────────────────── */
+    CASE
+        WHEN t.TotalDeletedSoFar > 0
+         AND rb.LatestRunningAuditID IS NOT NULL
+        THEN DATEADD(MILLISECOND,
+                CAST(
+                    (t.TotalRowsInRange - t.TotalDeletedSoFar)
+                    * 1.0 / t.TotalDeletedSoFar
+                    * DATEDIFF(MILLISECOND, t.PurgeStartTime, SYSDATETIME())
+                AS BIGINT),
+                SYSDATETIME())
+        ELSE NULL
+    END                                                         AS EstimatedFinishTime,
+
+    /* ── ETA: remaining hh:mm:ss ─────────────────────────────── */
+    CASE
+        WHEN t.TotalDeletedSoFar > 0
+         AND rb.LatestRunningAuditID IS NOT NULL
+        THEN
+            RIGHT('0' + CAST(
+                CAST((t.TotalRowsInRange - t.TotalDeletedSoFar)
+                    * 1.0 / t.TotalDeletedSoFar
+                    * DATEDIFF(MILLISECOND, t.PurgeStartTime, SYSDATETIME())
+                AS BIGINT) / 3600000 AS VARCHAR(4)), 4)
+            + ':' + RIGHT('0' + CAST(
+                CAST((t.TotalRowsInRange - t.TotalDeletedSoFar)
+                    * 1.0 / t.TotalDeletedSoFar
+                    * DATEDIFF(MILLISECOND, t.PurgeStartTime, SYSDATETIME())
+                AS BIGINT) / 60000 % 60 AS VARCHAR(2)), 2)
+            + ':' + RIGHT('0' + CAST(
+                CAST((t.TotalRowsInRange - t.TotalDeletedSoFar)
+                    * 1.0 / t.TotalDeletedSoFar
+                    * DATEDIFF(MILLISECOND, t.PurgeStartTime, SYSDATETIME())
+                AS BIGINT) / 1000 % 60 AS VARCHAR(2)), 2)
+        ELSE N'—'
+    END                                                         AS ETARemaining,
+
+    /* ── Throughput ──────────────────────────────────────────── */
+    CASE
+        WHEN DATEDIFF(SECOND, t.PurgeStartTime, SYSDATETIME()) > 0
+        THEN CAST(
+                t.TotalDeletedSoFar * 1.0
+                / DATEDIFF(SECOND, t.PurgeStartTime, SYSDATETIME())
+             AS DECIMAL(12,1))
+        ELSE NULL
+    END                                                         AS AvgRowsPerSec,
+
+    /* ── Current batch detail ────────────────────────────────── */
+    rb_detail.RangeDeletion                                     AS CurrentBatchRange,
+    rb_detail.RowsLeftToDelete                                  AS CurrentBatchRowsLeft,
+    rb_detail.BatchStartTime                                    AS CurrentBatchStartTime,
+
+    DATEDIFF(MILLISECOND,
+        rb_detail.BatchStartTime, SYSDATETIME())                AS CurrentBatchElapsedMs,
+
+    /* Current batch elapsed hh:mm:ss */
+    CASE WHEN rb.LatestRunningAuditID IS NOT NULL
+         THEN
+             RIGHT('0' + CAST(DATEDIFF(MILLISECOND, rb_detail.BatchStartTime, SYSDATETIME()) / 3600000        AS VARCHAR(4)), 4)
+             + ':' + RIGHT('0' + CAST(DATEDIFF(MILLISECOND, rb_detail.BatchStartTime, SYSDATETIME()) / 60000 % 60 AS VARCHAR(2)), 2)
+             + ':' + RIGHT('0' + CAST(DATEDIFF(MILLISECOND, rb_detail.BatchStartTime, SYSDATETIME()) /  1000 % 60 AS VARCHAR(2)), 2)
+         ELSE NULL
+    END                                                         AS CurrentBatchElapsedHMS,
+
+    /* ── Stuck-batch detection ───────────────────────────────── */
+    CASE
+        WHEN rb.LatestRunningAuditID IS NULL        THEN NULL
+        WHEN bt.CompletedBatches IS NULL
+          OR bt.CompletedBatches < 3                THEN N'Insufficient history'
+        WHEN bt.AvgBatchMs = 0                      THEN NULL
+        WHEN DATEDIFF(MILLISECOND,
+                rb_detail.BatchStartTime,
+                SYSDATETIME()) > bt.AvgBatchMs * 2
+        THEN N'SLOW  '
+             + CAST(CAST(
+                 DATEDIFF(MILLISECOND, rb_detail.BatchStartTime, SYSDATETIME())
+                 * 1.0 / NULLIF(bt.AvgBatchMs, 0)
+               AS DECIMAL(5,1)) AS VARCHAR(8))
+             + N'x avg  (avg ' + CAST(bt.AvgBatchMs AS VARCHAR(10))
+             + N' ms  max '    + CAST(bt.MaxBatchMs  AS VARCHAR(10)) + N' ms)'
+        ELSE N'OK  '
+             + CAST(CAST(
+                 DATEDIFF(MILLISECOND, rb_detail.BatchStartTime, SYSDATETIME())
+                 * 1.0 / NULLIF(bt.AvgBatchMs, 0)
+               AS DECIMAL(5,1)) AS VARCHAR(8))
+             + N'x avg'
+    END                                                         AS BatchHealthComment
+
+FROM Totals t
+LEFT JOIN RunningBatch rb
+       ON rb.TableName = t.TableName
+LEFT JOIN [YourAuditDB].[dbo].[PurgeAuditLog] rb_detail
+       ON rb_detail.AuditID = rb.LatestRunningAuditID
+LEFT JOIN BatchTiming bt
+       ON bt.TableName = t.TableName;
+GO
+
+
+SELECT
+    InstanceName,
+    DBName,
+    TableName,
+    SessionID,
+    [Status],
+    TotalRowsInRange,
+    TotalDeletedSoFar,
+    RowsRemaining,
+    CAST(PctComplete AS VARCHAR(6)) + ' %'  AS [Done%],
+    ElapsedHMS,
+    ETARemaining,
+    EstimatedFinishTime,
+    AvgRowsPerSec,
+    CompletedBatches,
+    AvgBatchDurationMs,
+    CurrentBatchRange,
+    CurrentBatchRowsLeft,
+    CurrentBatchStartTime,
+    CurrentBatchElapsedMs,
+    CurrentBatchElapsedHMS,
+    BatchHealthComment,
+    PurgeStartTime,
+    [Now],
+    ElapsedMs
+FROM [dbo].[vw_PurgeProgress]
+WHERE 1 = 1
+  -- AND InstanceName = N'YOUR_INSTANCE_NAME'   -- e.g. N'SQLPROD01'
+  -- AND DBName       = N'YOUR_DATABASE_NAME'   -- e.g. N'OrdersDB'
+  -- AND TableName    LIKE N'%YOUR_TABLE%'       -- partial match supported
+  -- AND [Status]     = N'RUNNING'               -- hide finished tables
+ORDER BY [Status] DESC, InstanceName, DBName, TableName;
+GO
+
+
+/*
+DECLARE @InstanceFilter NVARCHAR(128) = NULL;   -- NULL = all instances
+DECLARE @DBFilter       NVARCHAR(128) = NULL;   -- NULL = all databases
+DECLARE @TableFilter    NVARCHAR(400) = NULL;   -- NULL = all tables
+
+WHILE 1 = 1
+BEGIN
+    PRINT CONVERT(nvarchar(23), SYSDATETIME(), 121) + '  -- snapshot';
+
+    SELECT
+        InstanceName,
+        DBName,
+        TableName,
+        [Status],
+        CAST(PctComplete AS VARCHAR(6)) + ' %'  AS [Done%],
+        ElapsedHMS,
+        ETARemaining,
+        AvgRowsPerSec,
+        CompletedBatches,
+        CurrentBatchElapsedHMS,
+        BatchHealthComment
+    FROM [dbo].[vw_PurgeProgress]
+    WHERE (@InstanceFilter IS NULL OR InstanceName = @InstanceFilter)
+      AND (@DBFilter       IS NULL OR DBName       = @DBFilter)
+      AND (@TableFilter    IS NULL OR TableName     LIKE N'%' + @TableFilter + N'%')
+    ORDER BY [Status] DESC, InstanceName, DBName, TableName;
+
+    WAITFOR DELAY '00:00:10';
+END
+*/
