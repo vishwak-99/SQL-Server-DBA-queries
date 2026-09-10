@@ -1,0 +1,108 @@
+-- =============================================
+-- STEP 1: DROP TEMP TABLE IF EXISTS
+-- =============================================
+IF OBJECT_ID('tempdb..RetentionConfig') IS NOT NULL
+    DROP TABLE tempdb..RetentionConfig;
+
+-- =============================================
+-- STEP 2: CREATE TEMP TABLE
+-- =============================================
+CREATE TABLE tempdb..RetentionConfig (
+    FullTableName  VARCHAR(500),
+    RetentionTime  INT,
+    InputCol       VARCHAR(500),
+    DataType       VARCHAR(50)
+);
+
+-- =============================================
+-- STEP 3: INSERT YOUR DATA
+-- =============================================
+INSERT INTO tempdb..RetentionConfig (FullTableName, RetentionTime, InputCol, DataType)
+VALUES
+    ('MyDB.dbo.Orders',       -3, 'OrderDate',   'datetime'),
+    ('MyDB.dbo.Logs',         -5, 'LogDate',      'datetime2'),
+    ('MyDB.dbo.Transactions', -3, 'TransDate',    'varchar'),
+    ('MyDB.dbo.Customers',    -5, 'CreatedDate',  'date'),
+    ('MyDB.dbo.Archive',      -3, 'ArchiveDate',  'smalldatetime'),
+    ('MyDB.dbo.Sales',        -3, 'SaleYear',     'int');
+
+-- =============================================
+-- STEP 4: GENERATE AND PRINT QUERIES
+-- =============================================
+DECLARE @sql        NVARCHAR(MAX);
+DECLARE @table      VARCHAR(500);
+DECLARE @col        VARCHAR(500);
+DECLARE @dtype      VARCHAR(50);
+DECLARE @retention  INT;
+
+DECLARE cur CURSOR FOR
+    SELECT FullTableName, RetentionTime, InputCol, DataType
+    FROM tempdb..RetentionConfig;
+
+OPEN cur;
+FETCH NEXT FROM cur INTO @table, @retention, @col, @dtype;
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+
+    -- -----------------------------------------------
+    -- TEMPLATE 1: datetime family
+    -- -----------------------------------------------
+    IF LOWER(@dtype) IN ('datetime', 'datetime2', 'date', 'smalldatetime')
+    BEGIN
+        SET @sql =
+            '-- [' + @table + '] | Column: ' + @col + ' | Type: ' + @dtype + CHAR(13) +
+            'SELECT' + CHAR(13) +
+            '    COALESCE(CONVERT(VARCHAR(19), MIN(' + @col + '), 120), ''NA'') AS MinValue,' + CHAR(13) +
+            '    COALESCE(CONVERT(VARCHAR(19), MAX(' + @col + '), 120), ''NA'') AS MaxValue' + CHAR(13) +
+            'FROM ' + @table + CHAR(13) +
+            'WHERE ' + @col + ' <= DATEADD(YEAR, ' + CAST(@retention AS VARCHAR(10)) + ', (' + CHAR(13) +
+            '    SELECT MAX(' + @col + ') FROM ' + @table + CHAR(13) +
+            '));' + CHAR(13);
+    END
+
+    -- -----------------------------------------------
+    -- TEMPLATE 2: varchar / other (TRY_CONVERT)
+    -- -----------------------------------------------
+    ELSE IF LOWER(@dtype) NOT IN ('int', 'bigint', 'smallint', 'tinyint')
+    BEGIN
+        SET @sql =
+            '-- [' + @table + '] | Column: ' + @col + ' | Type: ' + @dtype + CHAR(13) +
+            'SELECT' + CHAR(13) +
+            '    COALESCE(CONVERT(VARCHAR(19), MIN(TRY_CONVERT(DATETIME, ' + @col + ')), 120), ''NA'') AS MinValue,' + CHAR(13) +
+            '    COALESCE(CONVERT(VARCHAR(19), MAX(TRY_CONVERT(DATETIME, ' + @col + ')), 120), ''NA'') AS MaxValue' + CHAR(13) +
+            'FROM ' + @table + CHAR(13) +
+            'WHERE TRY_CONVERT(DATETIME, ' + @col + ') <= DATEADD(YEAR, ' + CAST(@retention AS VARCHAR(10)) + ', (' + CHAR(13) +
+            '    SELECT MAX(TRY_CONVERT(DATETIME, ' + @col + ')) FROM ' + @table + CHAR(13) +
+            '));' + CHAR(13);
+    END
+
+    -- -----------------------------------------------
+    -- TEMPLATE 3: int / year columns
+    -- -----------------------------------------------
+    ELSE IF LOWER(@dtype) IN ('int', 'bigint', 'smallint', 'tinyint')
+    BEGIN
+        SET @sql =
+            '-- [' + @table + '] | Column: ' + @col + ' | Type: ' + @dtype + CHAR(13) +
+            '-- NOTE: INT year column - retention applied as year arithmetic' + CHAR(13) +
+            'SELECT' + CHAR(13) +
+            '    MIN(' + @col + ') AS MinValue,' + CHAR(13) +
+            '    MAX(' + @col + ') AS MaxValue' + CHAR(13) +
+            'FROM ' + @table + CHAR(13) +
+            'WHERE ' + @col + ' <= (SELECT MAX(' + @col + ') FROM ' + @table + ') + ' + CAST(@retention AS VARCHAR(10)) + ';' + CHAR(13);
+    END
+
+    PRINT @sql;
+    PRINT '----------------------------------------';
+
+    FETCH NEXT FROM cur INTO @table, @retention, @col, @dtype;
+END
+
+CLOSE cur;
+DEALLOCATE cur;
+
+-- =============================================
+-- STEP 5: DROP TEMP TABLE
+-- =============================================
+IF OBJECT_ID('tempdb..RetentionConfig') IS NOT NULL
+    DROP TABLE tempdb..RetentionConfig;
