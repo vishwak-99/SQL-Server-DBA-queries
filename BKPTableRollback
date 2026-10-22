@@ -1,0 +1,28 @@
+SET IDENTITY_INSERT AdventureWorks2022RollbackTest.Production.TransactionHistory ON;
+
+INSERT INTO AdventureWorks2022RollbackTest.Production.TransactionHistory
+(
+  TransactionID
+,ProductID
+,ReferenceOrderID
+,ReferenceOrderLineID
+,TransactionDate
+,TransactionType
+,Quantity
+,ActualCost
+,ModifiedDate
+)
+SELECT
+     TransactionID
+,ProductID
+,ReferenceOrderID
+,ReferenceOrderLineID
+,TransactionDate
+,TransactionType
+,Quantity
+,ActualCost
+,ModifiedDate
+FROM [AdventureWorks2022RollbackTestBKP].Production.TransactionHistoryBKP
+WHERE ModifiedDate BETWEEN '2013-12-23' AND '2014-01-21';
+
+SET IDENTITY_INSERT AdventureWorks2022RollbackTest.Production.TransactionHistory OFF;
