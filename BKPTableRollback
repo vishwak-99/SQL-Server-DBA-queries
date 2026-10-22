@@ -26,3 +26,41 @@ FROM [AdventureWorks2022RollbackTestBKP].Production.TransactionHistoryBKP
 WHERE ModifiedDate BETWEEN '2013-12-23' AND '2014-01-21';
 
 SET IDENTITY_INSERT AdventureWorks2022RollbackTest.Production.TransactionHistory OFF;
+
+
+/*
+SET IDENTITY_INSERT AdventureWorks2022RollbackTest.Production.TransactionHistory ON;
+
+INSERT INTO AdventureWorks2022RollbackTest.Production.TransactionHistory
+(
+   TransactionID
+  ,ProductID
+  ,ReferenceOrderID
+  ,ReferenceOrderLineID
+  ,TransactionDate
+  ,TransactionType
+  ,Quantity
+  ,ActualCost
+  ,ModifiedDate
+)
+SELECT
+   bkp.TransactionID
+  ,bkp.ProductID
+  ,bkp.ReferenceOrderID
+  ,bkp.ReferenceOrderLineID
+  ,bkp.TransactionDate
+  ,bkp.TransactionType
+  ,bkp.Quantity
+  ,bkp.ActualCost
+  ,bkp.ModifiedDate
+FROM [AdventureWorks2022RollbackTestBKP].Production.TransactionHistoryBKP bkp
+WHERE bkp.ModifiedDate BETWEEN '2013-12-23' AND '2014-05-21'
+AND EXISTS (
+    SELECT 1
+    FROM AdventureWorks2022RollbackTest.Production.Product p
+    WHERE p.ProductID = bkp.ProductID
+);
+
+SET IDENTITY_INSERT AdventureWorks2022RollbackTest.Production.TransactionHistory OFF;
+
+*/
